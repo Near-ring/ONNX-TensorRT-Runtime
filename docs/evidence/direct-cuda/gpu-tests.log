@@ -1,0 +1,32 @@
+   Compiling safe-inference v0.1.0 (/home/hgtech/codes/inference)
+    Finished `release` profile [optimized] target(s) in 1.35s
+     Running tests/copy_cache.rs (target/release/deps/copy_cache-df7c62fb326f3ce8)
+
+running 1 test
+600 checked forwards, 6 sessions, zero copy helpers; CUDA graphs on/off
+test gpu_copy_cache_stays_bounded_across_runs_and_session_drops ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.74s
+
+     Running tests/cuda_graph.rs (target/release/deps/cuda_graph-0a7d90dc1a5bba33)
+
+running 1 test
+test cuda_graph_replays_with_stable_bound_buffers ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.53s
+
+     Running tests/mixed_io.rs (target/release/deps/mixed_io-c39c77898e8e42ed)
+
+running 1 test
+test cuda_graph_replays_mixed_int64_fp16 ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.57s
+
+     Running tests/tensorrt.rs (target/release/deps/tensorrt-175e40a0fc3cc361)
+
+running 1 test
+[1;31m2026-09-22 15:13:38.667663150 [E:onnxruntime:, inference_session.cc:2985 Initialize] This session contains graph nodes that are assigned to the default CPU EP, but fallback to CPU EP has been explicitly disabled by the user.[m
+test compile_load_inference_and_strict_backend ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.24s
+

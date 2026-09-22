@@ -1,0 +1,43 @@
+warning: unused macro definition: `debug`
+  --> vendor/ort/src/logging.rs:49:14
+   |
+49 | macro_rules! debug {
+   |              ^^^^^
+   |
+   = note: `#[warn(unused_macros)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `format`
+ --> vendor/ort/src/value/impl_tensor/copy.rs:5:2
+  |
+5 |     format,
+  |     ^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `debug`
+  --> vendor/ort/src/lib.rs:73:32
+   |
+73 | pub(crate) use self::logging::{debug, error, info, trace, warning as warn};
+   |                                ^^^^^
+
+warning: associated function `from_raw` is never used
+   --> vendor/ort/src/value/type.rs:323:23
+    |
+310 | impl Outlet {
+    | ----------- associated function in this implementation
+...
+323 |     pub(crate) unsafe fn from_raw(raw: NonNull<ort_sys::OrtValueInfo>, drop: bool) -> Result<Self> {
+    |                          ^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ort` (lib) generated 4 warnings (run `cargo fix --lib -p ort` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running tests/copy_cache.rs (target/release/deps/copy_cache-4877ba15a9dcde56)
+
+running 1 test
+600 checked forwards, 6 sessions, 2 persistent copy helpers; CUDA graphs on/off
+test gpu_copy_cache_stays_bounded_across_runs_and_session_drops ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.58s
+

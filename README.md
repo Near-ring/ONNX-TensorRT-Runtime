@@ -1,4 +1,4 @@
-# safe-inference
+# Inference
 
 Safe Rust ONNX inference using an existing ONNX Runtime installation. The API has three steps:
 `compile`, `load`, and `inference`. Compilation is optional when loading an ordinary ONNX model.
@@ -199,52 +199,17 @@ The TensorRT EP has no TF32 provider option; the API validates the process setti
 requested configuration cannot silently be overridden.
 CUDA's `CudaOptions::tf32` is configured separately through its provider API.
 
-All crate code forbids `unsafe`. ORT and its native providers still use native code, which can crash;
+Unsafe code is restricted to the private CUDA transfer module. ORT and its native providers use native code, which can crash;
 safe Rust cannot turn a native process crash into a recoverable `Result`. Methods are synchronous.
 `OnnxRuntime` is neither `Send` nor `Sync`; construct a separate instance inside each
 concurrent inference worker.
 
-## SAM3 folder example
+## GPU copy-cache fix
 
-The [Rust example](examples/sam3_render.rs) reads JPEG/PNG files from one folder and
-writes green segmentation overlays to another. Edit its `PROMPT` constant to change
-the text prompt. A Rust CLIP tokenizer encodes that text from the bundled BPE data;
-no token IDs are hardcoded in the example. Image processing, ONNX inference, and
-rendering run in Rust.
+The engine bypasses an `ort` tensor-copy cache lifetime bug with direct CUDA
+transfers between persistent pinned host buffers and device buffers. It uses
+the unmodified registry `ort` crate; unsafe FFI is isolated in
+`src/cuda_transfer.rs`. The fix applies to `inference()`, `inference_into()`, and `run()`, including CUDA graph replay
+and repeated session creation. No extra cleanup call is required. See
+[scope, validation, and dependency maintenance](docs/ort-copy-cache-fix.md).
 
-The retained [Mixed CUDA model](sam3/README.md) uses a mixed precision image
-encoder with FP32 graph I/O, plus FP32 text and decoder graphs. The example uses
-its text-only decoder. The box-capable decoder is also retained as part of the
-selected strategy.
-
-Set `ORT_DYLIB_PATH` to a compatible ONNX Runtime shared library and put its
-native CUDA dependencies on `LD_LIBRARY_PATH`. Then run from this directory:
-
-```bash
-cargo run --release --example sam3_render -- samples rendered cuda
-# CPU fallback (requires a CPU-capable ONNX Runtime):
-cargo run --release --example sam3_render -- samples rendered_cpu cpu
-```
-
-The sample `.jpg` names may contain PNG data; the example detects the image
-format from file contents. It processes images in sorted order and reuses the
-model sessions. Each output is named `<input-name>.overlay.png`. It prints
-per-image encoder/decoder inference time and the folder average; timing includes
-model output transfer to Rust and the first inference call, but excludes
-preprocessing, rendering, and model loading. The example leaves CUDA graphs
-disabled by default; set `cuda_graph: true` in its `CudaOptions` to try capture.
-Its I64 text encoder now has prepared buffers as well.
-
-## Checks
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-```
-
-Native backends are not downloaded by this crate. The loader uses
-`options.runtime_path`, then `ORT_DYLIB_PATH`, then the platform's standard
-ONNX Runtime library name. CUDA requires a compatible installed runtime, CUDA
-libraries, and driver. CPU inference also requires an installed CPU-capable
-ONNX Runtime. `src/` contains the library API; `tests/` contains its tests.

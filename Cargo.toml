@@ -9,6 +9,7 @@ anyhow = "1.0.104"
 flate2 = "1.1.10"
 half = "2.7.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+libloading = "0.9.0"
 onnx-rs = "0.1.2"
 ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "load-dynamic", "tensorrt", "cuda", "api-27", "half"] }
 regex = "1.13.1"

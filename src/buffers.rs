@@ -1,10 +1,11 @@
 //! Reusable host/device tensors and I/O bindings for static, dense tensor I/O.
+use crate::cuda_transfer;
 use crate::{DType, ModelInfo, Result, TensorData, TensorDataMut, TensorView, TensorViewMut};
 use anyhow::{Context, ensure};
 use ort::{
     memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType},
     session::{IoBinding, Session},
-    value::{DynTensor, DynValue, TensorElementType, TensorRefMut, TensorValueType},
+    value::{DynTensor, DynTensorValueType, TensorElementType},
 };
 
 pub(crate) struct TensorSlot {
@@ -19,6 +20,7 @@ pub(crate) struct InferenceBuffers {
     pub outputs: Vec<TensorSlot>,
     binding: IoBinding,
     gpu: bool,
+    device_id: i32,
     pub valid_output: bool,
     // ORT allocated tensors do not retain the Allocator wrapper. Keep both alive
     // until after all tensors and I/O bindings have been dropped (field order).
@@ -87,21 +89,6 @@ macro_rules! view_data_mut {
         ))
     };
 }
-macro_rules! download_typed {
-    ($slot:expr, $value:expr, $variant:ident, $ty:ty) => {{
-        // Storage stays CUDA-pinned; this borrowed CPU view avoids the ORT 1.29
-        // direct-CudaPinned D2H error. Its lifetime is bounded by the slot.
-        let mut cpu = TensorRefMut::from_array_view_mut((
-            $slot.shape.as_slice(),
-            $slot.host.try_extract_tensor_mut::<$ty>()?.1,
-        ))?;
-        $value
-            .downcast_ref::<TensorValueType<$ty>>()?
-            .copy_into(&mut cpu)
-            .context("Safe D2H transfer")?;
-        Ok(())
-    }};
-}
 
 impl TensorSlot {
     pub fn view(&self) -> Result<TensorView<'_>> {
@@ -119,9 +106,6 @@ impl TensorSlot {
             shape: &self.shape,
             data,
         })
-    }
-    fn download(&mut self, value: &DynValue) -> Result<()> {
-        dispatch_dtype!(self.dtype, download_typed, self, value)
     }
 }
 
@@ -207,6 +191,7 @@ impl InferenceBuffers {
             outputs,
             binding,
             gpu,
+            device_id,
             valid_output: false,
             _host_allocator: host,
             _device_allocator: device,
@@ -215,18 +200,29 @@ impl InferenceBuffers {
     pub fn run(&mut self, session: &mut Session) -> Result<()> {
         self.valid_output = false;
         if self.gpu {
-            for input in &mut self.inputs {
-                input
-                    .host
-                    .copy_into(input.device.as_mut().expect("GPU input"))
-                    .context("Safe H2D transfer")?;
-            }
+            cuda_transfer::upload(
+                self.inputs
+                    .iter_mut()
+                    .map(|input| (&input.host, input.device.as_mut().expect("GPU input"))),
+                self.device_id,
+            )
+            .context("Pinned H2D transfers")?;
         }
         let values = session.run_binding(&self.binding).context("Inference")?;
         if self.gpu {
-            for output in &mut self.outputs {
-                output.download(&values[output.name.as_str()])?;
-            }
+            let device_outputs = self
+                .outputs
+                .iter()
+                .map(|output| values[output.name.as_str()].downcast_ref::<DynTensorValueType>())
+                .collect::<ort::Result<Vec<_>>>()?;
+            cuda_transfer::download(
+                device_outputs
+                    .iter()
+                    .zip(&mut self.outputs)
+                    .map(|(value, output)| (&**value, &mut output.host)),
+                self.device_id,
+            )
+            .context("Pinned D2H transfers")?;
         }
         self.valid_output = true;
         Ok(())

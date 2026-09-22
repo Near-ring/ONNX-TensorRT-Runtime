@@ -1,0 +1,31 @@
+{
+  "date": "2026-09-22",
+  "wrapper_version": "2.0.0-rc.13",
+  "wrapper_source": "vendor/ort",
+  "upstream_commit": "002f41a8e175eac7f6695ff361d2e51a50874c48",
+  "upstream_rust_files_changed": [
+    "src/value/impl_tensor/copy.rs"
+  ],
+  "regression": {
+    "repeated_forwards": 600,
+    "session_lifetimes": 6,
+    "persistent_copy_helpers": 2,
+    "ort_1_29_1": "passed",
+    "ort_1_30_0": "passed",
+    "original_wrapper": "failed at cycle 0 step 1: an extra CUDA arena"
+  },
+  "sam3": {
+    "images": 68,
+    "peak_process_gpu_mib": 9574.0,
+    "steady_window_seconds": [
+      25,
+      75
+    ],
+    "steady_min_gpu_mib": 9574.0,
+    "steady_max_gpu_mib": 9574.0,
+    "average_inference_ms": 1071.0,
+    "matching_isolated_patch_overlay_sha256": 68,
+    "output_directory": "/tmp/inference-engine-patch/rendered"
+  },
+  "downstream_path_consumer": "cargo check passed; ort resolved to engine vendor/ort"
+}

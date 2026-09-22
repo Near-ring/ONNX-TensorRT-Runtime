@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 //! ONNX inference with explicit TensorRT compilation and selectable provider fallback.
 //! Use [`OnnxRuntime::inference_into`] for caller-owned outputs, or
 //! [`OnnxRuntime::input_mut`], [`OnnxRuntime::run`], and [`OnnxRuntime::output`]
@@ -6,6 +6,9 @@
 
 mod api;
 mod buffers;
+// The only engine module allowed to call the dynamically loaded CUDA driver.
+#[allow(unsafe_code)]
+mod cuda_transfer;
 mod engine;
 mod options;
 mod session;

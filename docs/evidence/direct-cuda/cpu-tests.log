@@ -1,0 +1,74 @@
+   Compiling safe-inference v0.1.0 (/home/hgtech/codes/inference)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.69s
+     Running unittests src/lib.rs (target/debug/deps/safe_inference-d34aa8817900ee79)
+
+running 1 test
+test cuda_transfer::tests::copy_sizes_reject_overflow_and_non_byte_types ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/compile.rs (target/debug/deps/compile-e1c31c87b05a8b06)
+
+running 2 tests
+test compiled_cpu_model_does_not_depend_on_external_source_weights ... ok
+test cpu_compile_roundtrip_and_auto_fallback ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/copy_cache.rs (target/debug/deps/copy_cache-64b9f1e6690ec82f)
+
+running 1 test
+test gpu_copy_cache_stays_bounded_across_runs_and_session_drops ... ignored, requires a host CUDA GPU and ORT's verbose CUDA arena creation logs
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cuda_graph.rs (target/debug/deps/cuda_graph-907e7cec07806b11)
+
+running 1 test
+test cuda_graph_replays_with_stable_bound_buffers ... ignored, requires a host CUDA GPU and compatible ONNX Runtime libraries
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mixed_io.rs (target/debug/deps/mixed_io-b67c964fd5a45e1e)
+
+running 2 tests
+test cuda_graph_replays_mixed_int64_fp16 ... ignored, requires a host CUDA GPU and compatible ONNX Runtime libraries
+test cpu_prepared_mixed_int64_fp16 ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/onnx.rs (target/debug/deps/onnx-ebb076203941317b)
+
+running 9 tests
+test defaults_use_level_three_and_opt_in_fp16 ... ok
+test no_configured_backend_is_an_error ... ok
+test cpu_ignores_unrelated_gpu_settings ... ok
+test dynamic_int64_and_reused_output ... ok
+test ordinary_onnx_detection_does_not_depend_on_extension ... ok
+test cpu_multi_input_buffers_and_validation ... ok
+test invalid_provider_options_obey_backend_selection ... ok
+test required_unavailable_provider_returns_error ... ok
+test unavailable_configured_provider_falls_back_with_reason ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/tensor.rs (target/debug/deps/tensor-32aa515547b0f653)
+
+running 1 test
+test checked_dimensions_and_scalar ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/tensorrt.rs (target/debug/deps/tensorrt-903bb222b74ea872)
+
+running 1 test
+test compile_load_inference_and_strict_backend ... ignored, requires host NVIDIA GPU and existing TensorRT libraries; builds only tiny models
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests safe_inference
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
