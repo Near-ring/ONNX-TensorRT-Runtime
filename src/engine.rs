@@ -10,7 +10,7 @@ use std::{collections::BTreeSet, fs, path::Path};
 #[derive(Clone, Copy)]
 pub(crate) enum ModelFormat {
     Onnx,
-    EpContext { fixed_fp32: bool },
+    EpContext { static_io: bool },
 }
 
 /// Detect compiled wrappers from their contents, regardless of the file extension.
@@ -22,16 +22,20 @@ pub(crate) fn inspect(path: &Path) -> Result<ModelFormat> {
         .node
         .iter()
         .any(|node| node.domain == "com.microsoft" && node.op_type == OpType::Custom("EPContext"));
-    let fixed = !graph.input.is_empty()
+    let static_io = !graph.input.is_empty()
         && !graph.output.is_empty()
         && graph.input.iter().chain(&graph.output).all(|value| {
             matches!(value.r#type.as_ref().and_then(|t| t.value.as_ref()),
-                Some(TypeValue::Tensor(t)) if t.elem_type == DataType::Float
+                Some(TypeValue::Tensor(t)) if matches!(t.elem_type,
+                    DataType::Float | DataType::Double | DataType::Float16 | DataType::Bfloat16 |
+                    DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 |
+                    DataType::Uint64 | DataType::Uint32 | DataType::Uint16 | DataType::Uint8 |
+                    DataType::Bool)
                     && t.shape.as_ref().is_some_and(|s| s.dim.iter().all(|d|
                         matches!(d.value, Dimension::Value(n) if n > 0))))
         });
     Ok(if compiled {
-        ModelFormat::EpContext { fixed_fp32: fixed }
+        ModelFormat::EpContext { static_io }
     } else {
         ModelFormat::Onnx
     })
@@ -40,8 +44,14 @@ pub(crate) fn inspect(path: &Path) -> Result<ModelFormat> {
 fn value<'a>(spec: &'a TensorSpec, symbols: &'a [String]) -> Result<ValueInfo<'a>> {
     let elem_type = match spec.dtype {
         DType::F32 => DataType::Float,
+        DType::F16 => DataType::Float16,
+        DType::BF16 => DataType::Bfloat16,
         DType::U8 => DataType::Uint8,
+        DType::U16 => DataType::Uint16,
+        DType::U32 => DataType::Uint32,
+        DType::U64 => DataType::Uint64,
         DType::I8 => DataType::Int8,
+        DType::I16 => DataType::Int16,
         DType::I32 => DataType::Int32,
         DType::I64 => DataType::Int64,
         DType::Bool => DataType::Bool,

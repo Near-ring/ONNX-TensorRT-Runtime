@@ -31,9 +31,10 @@ pub struct TensorRtOptions {
     /// GPU ordinal, default 0.
     pub device_id: i32,
     pub fp16: bool,
-    /// Must agree with the process-wide NVIDIA_TF32_OVERRIDE setting.
+    /// Allow TF32 for TensorRT FP32 operations (default true).
+    /// The process-wide NVIDIA_TF32_OVERRIDE must be unset for true, or 0 for false.
     pub tf32: bool,
-    /// Enable CUDA graphs for fixed-shape FP32 TensorRT inputs and outputs.
+    /// Enable CUDA graphs for fixed-shape, supported tensor I/O.
     pub cuda_graph: bool,
     pub workspace_bytes: usize,
     pub builder_optimization_level: u8,
@@ -48,7 +49,7 @@ impl Default for TensorRtOptions {
     fn default() -> Self {
         Self {
             device_id: 0,
-            fp16: true,
+            fp16: false,
             tf32: true,
             cuda_graph: true,
             workspace_bytes: 4 * 1024 * 1024 * 1024,
@@ -68,12 +69,16 @@ pub struct CudaOptions {
     /// GPU ordinal, default 0.
     pub device_id: i32,
     pub tf32: bool,
+    /// Capture and replay fixed-shape models through persistent I/O bindings.
+    /// Disabled by default; ignored when graph I/O is not eligible for prepared buffers.
+    pub cuda_graph: bool,
 }
 impl Default for CudaOptions {
     fn default() -> Self {
         Self {
             device_id: 0,
             tf32: true,
+            cuda_graph: false,
         }
     }
 }

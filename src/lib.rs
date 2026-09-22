@@ -18,5 +18,5 @@ pub use options::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtO
 pub use ort::ep;
 pub use tensor::{
     DType, Tensor, TensorBuffer, TensorData, TensorDataMut, TensorSpec, TensorView, TensorViewMut,
-    element_count,
+    bf16, element_count, f16,
 };

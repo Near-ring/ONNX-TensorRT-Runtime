@@ -8,7 +8,9 @@ use crate::{buffers, engine, session};
 use anyhow::{Context, bail, ensure};
 use std::{
     fs,
+    marker::PhantomData,
     path::{Path, PathBuf},
+    rc::Rc,
 };
 
 /// ONNX input and output names, data types, and shapes.
@@ -50,6 +52,7 @@ pub struct OnnxRuntime {
     active: Option<ActiveSession>,
     fallback_events: Vec<FallbackEvent>,
     compiled: bool,
+    _no_send_sync: PhantomData<Rc<()>>,
 }
 
 impl OnnxRuntime {
@@ -152,7 +155,7 @@ impl OnnxRuntime {
             }
         }
     }
-    /// Run inference into caller-owned output buffers. Fixed FP32 models reuse prepared storage.
+    /// Run inference into caller-owned output buffers. Fixed tensor I/O reuses prepared storage.
     pub fn inference_into(
         &mut self,
         inputs: &[TensorView<'_>],
@@ -213,13 +216,13 @@ impl OnnxRuntime {
 }
 
 impl OnnxRuntime {
-    /// Borrow a persistent input buffer for a fixed-shape FP32 model.
+    /// Borrow a persistent input buffer for fixed-shape tensor I/O.
     pub fn input_mut(&mut self, name: &str) -> Result<TensorViewMut<'_>> {
         let buffers = self
             .active
             .as_mut()
             .and_then(|a| a.buffers.as_mut())
-            .context("Prepared buffers unavailable; use inference for dynamic or non-FP32 I/O")?;
+            .context("Prepared buffers unavailable; use inference for dynamic I/O")?;
         buffers.valid_output = false;
         buffers
             .inputs
@@ -246,7 +249,7 @@ impl OnnxRuntime {
             .context("Unknown output")?
             .view()
     }
-    /// Run the fixed-shape FP32 model using its persistent input and output buffers.
+    /// Run the fixed-shape model using its persistent input and output buffers.
     pub fn run(&mut self) -> Result<()> {
         let active = self.active.as_mut().context("No active backend")?;
         let buffers = active
@@ -326,15 +329,16 @@ impl OnnxRuntime {
             active: None,
             fallback_events: Vec::new(),
             compiled: matches!(format, ModelFormat::EpContext { .. }),
+            _no_send_sync: PhantomData,
         };
-        if let ModelFormat::EpContext { fixed_fp32 } = format {
+        if let ModelFormat::EpContext { static_io } = format {
             ensure!(
                 build_directory.is_none(),
                 "Compile requires the original ONNX graph"
             );
             let mut failures = Vec::new();
             for index in 0..model.options.backend.candidates().len() {
-                match session::load(&model.path, &model.options, index, true, fixed_fp32, None) {
+                match session::load(&model.path, &model.options, index, true, static_io, None) {
                     Ok(active) => {
                         model.active = Some(active);
                         break;

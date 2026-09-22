@@ -58,7 +58,7 @@ fn builder(options: &OnnxOptions, profiling: bool) -> Result<SessionBuilder> {
     Ok(session_builder)
 }
 
-fn tensorrt_provider(options: &OnnxOptions, fixed_fp32: bool) -> Result<TensorRT> {
+fn tensorrt_provider(options: &OnnxOptions, static_io_tensor: bool) -> Result<TensorRT> {
     let defaults = TensorRtOptions::default();
     let settings = options.tensorrt.as_ref().unwrap_or(&defaults);
     settings.validate()?;
@@ -71,7 +71,7 @@ fn tensorrt_provider(options: &OnnxOptions, fixed_fp32: bool) -> Result<TensorRT
         .with_max_workspace_size(settings.workspace_bytes)
         .with_builder_optimization_level(settings.builder_optimization_level)
         .with_auxiliary_streams(settings.auxiliary_streams)
-        .with_cuda_graph(fixed_fp32 && settings.cuda_graph);
+        .with_cuda_graph(static_io_tensor && settings.cuda_graph);
     if let Some(v) = &settings.min_shapes {
         provider = provider.with_profile_min_shapes(v);
     }
@@ -84,17 +84,23 @@ fn tensorrt_provider(options: &OnnxOptions, fixed_fp32: bool) -> Result<TensorRT
     Ok(provider)
 }
 
-fn cuda_provider(settings: CudaOptions) -> Result<CUDA> {
+fn cuda_provider(settings: CudaOptions, static_io_tensor: bool) -> Result<CUDA> {
     settings.validate()?;
     Ok(CUDA::default()
         .with_device_id(settings.device_id)
-        .with_tf32(settings.tf32))
+        .with_tf32(settings.tf32)
+        .with_cuda_graph(static_io_tensor && settings.cuda_graph))
 }
 
 fn check_tf32(enabled: bool) -> Result<()> {
-    let tf32_disabled = std::env::var("NVIDIA_TF32_OVERRIDE").as_deref() == Ok("0");
+    let override_value = std::env::var_os("NVIDIA_TF32_OVERRIDE");
+    let valid = if enabled {
+        override_value.is_none()
+    } else {
+        override_value.as_deref().and_then(|value| value.to_str()) == Some("0")
+    };
     ensure!(
-        enabled != tf32_disabled,
+        valid,
         "TensorRT TF32 follows process NVIDIA_TF32_OVERRIDE: unset it for tf32=true, set to 0 for tf32=false"
     );
     Ok(())
@@ -111,10 +117,16 @@ pub(super) fn metadata(session: &Session) -> Result<ModelInfo> {
                 let dtype = match ty {
                     TensorElementType::Float32 => DType::F32,
                     TensorElementType::Float64 => DType::F64,
+                    TensorElementType::Float16 => DType::F16,
+                    TensorElementType::Bfloat16 => DType::BF16,
                     TensorElementType::Int64 => DType::I64,
                     TensorElementType::Int32 => DType::I32,
-                    TensorElementType::Uint8 => DType::U8,
+                    TensorElementType::Int16 => DType::I16,
                     TensorElementType::Int8 => DType::I8,
+                    TensorElementType::Uint64 => DType::U64,
+                    TensorElementType::Uint32 => DType::U32,
+                    TensorElementType::Uint16 => DType::U16,
+                    TensorElementType::Uint8 => DType::U8,
                     TensorElementType::Bool => DType::Bool,
                     _ => bail!("Unsupported I/O dtype {ty:?}"),
                 };
@@ -155,7 +167,7 @@ fn configured_builder(
     options: &OnnxOptions,
     index: usize,
     compiled: bool,
-    fixed_fp32: bool,
+    static_io: bool,
     build_directory: Option<&Path>,
 ) -> Result<SessionBuilder> {
     let candidates = options.backend.candidates();
@@ -169,13 +181,16 @@ fn configured_builder(
     }
     match backend {
         Backend::TensorRt => {
-            let mut provider = tensorrt_provider(options, fixed_fp32)?
+            let mut provider = tensorrt_provider(options, static_io)?
                 .with_engine_cache(false)
                 .with_ep_context_embed_mode(1);
-            if let Some(directory) = build_directory {
+            let configured_cache = std::env::var_os("ORT_TENSORRT_CACHE_PATH")
+                .filter(|path| !path.is_empty())
+                .map(PathBuf::from);
+            if let Some(directory) = build_directory.or(configured_cache.as_deref()) {
                 let directory = directory
                     .to_str()
-                    .context("Compile directory must be UTF-8")?;
+                    .context("TensorRT cache path must be UTF-8")?;
                 provider = provider
                     .with_engine_cache(true)
                     .with_engine_cache_path(directory);
@@ -188,7 +203,7 @@ fn configured_builder(
             {
                 // A secondary CUDA provider is optional in Auto mode. Invalid options
                 // are handled as an error if CUDA is later tried as the primary provider.
-                if let Ok(provider) = cuda_provider(options.cuda.unwrap_or_default()) {
+                if let Ok(provider) = cuda_provider(options.cuda.unwrap_or_default(), false) {
                     providers.push(provider.build());
                 }
             }
@@ -198,9 +213,12 @@ fn configured_builder(
         }
         Backend::Cuda => {
             session_builder = session_builder
-                .with_execution_providers([cuda_provider(options.cuda.unwrap_or_default())?
-                    .build()
-                    .error_on_failure()])
+                .with_execution_providers([cuda_provider(
+                    options.cuda.unwrap_or_default(),
+                    static_io,
+                )?
+                .build()
+                .error_on_failure()])
                 .map_err(ort_error)?;
         }
         Backend::Cpu => {
@@ -232,12 +250,12 @@ pub(crate) fn load(
     options: &OnnxOptions,
     index: usize,
     compiled: bool,
-    fixed_fp32: bool,
+    static_io: bool,
     build_directory: Option<&Path>,
 ) -> Result<ActiveSession> {
     let backend = &options.backend.candidates()[index];
     let mut session_builder =
-        configured_builder(options, index, compiled, fixed_fp32, build_directory)?;
+        configured_builder(options, index, compiled, static_io, build_directory)?;
     let session = session_builder.commit_from_file(path)?;
     let info = metadata(&session)?;
     let device_id = match backend {
@@ -279,10 +297,7 @@ impl ActiveSession {
                     .iter_mut()
                     .find(|x| x.name == input.name)
                     .expect("validated input");
-                slot.host
-                    .try_extract_tensor_mut::<f32>()?
-                    .1
-                    .copy_from_slice(input.as_f32()?);
+                slot.view_mut()?.data.copy_from(input.data)?;
             }
             buffers.run(&mut self.session).and_then(|()| {
                 buffers
@@ -319,7 +334,9 @@ fn input_value<'a>(input: &'a TensorView<'a>) -> Result<SessionInputValue<'a>> {
             }
         };
     }
-    convert!(F32, F64, I64, I32, U8, I8, Bool)
+    convert!(
+        F32, F64, F16, BF16, I64, I32, I16, I8, U64, U32, U16, U8, Bool
+    )
 }
 
 fn owned_output(name: &str, value: &DynValue, dtype: DType) -> Result<Tensor> {
@@ -340,5 +357,5 @@ fn owned_output(name: &str, value: &DynValue, dtype: DType) -> Result<Tensor> {
             }
         };
     }
-    convert!(F32: f32, F64: f64, I64: i64, I32: i32, U8: u8, I8: i8, Bool: bool)
+    convert!(F32: f32, F64: f64, F16: half::f16, BF16: half::bf16, I64: i64, I32: i32, I16: i16, I8: i8, U64: u64, U32: u32, U16: u16, U8: u8, Bool: bool)
 }

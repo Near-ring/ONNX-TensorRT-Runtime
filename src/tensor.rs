@@ -1,5 +1,6 @@
 use crate::Result;
 use anyhow::{bail, ensure};
+pub use half::{bf16, f16};
 
 /// Dense, contiguous, row-major tensor. Scalars have shape `[]` and one element.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +93,7 @@ macro_rules! tensor_types {
         }
     };
 }
-tensor_types!(F32: f32, F64: f64, I64: i64, I32: i32, U8: u8, I8: i8, Bool: bool);
+tensor_types!(F32: f32, F64: f64, F16: f16, BF16: bf16, I64: i64, I32: i32, I16: i16, I8: i8, U64: u64, U32: u32, U16: u16, U8: u8, Bool: bool);
 
 #[derive(Clone, Copy, Debug)]
 pub struct TensorView<'a> {
