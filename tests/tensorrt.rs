@@ -1,8 +1,8 @@
 //! Opt-in GPU integration tests; native TensorRT/CUDA libraries must already exist.
 #![forbid(unsafe_code)]
-use safe_inference::{
-    Backend, BackendSelection, CompiledFormat, CudaOptions, OnnxOptions, OnnxRuntime, Result,
-    TensorRtOptions, TensorView,
+use native_onnx::{
+    Backend, BackendSelection, CompileOptions, CompileTarget, CompiledFormat, CudaOptions,
+    OnnxOptions, OnnxRuntime, Result, TensorRtOptions, TensorView,
 };
 mod common;
 use common::fixture;
@@ -10,18 +10,23 @@ use common::fixture;
 #[test]
 #[ignore = "requires host NVIDIA GPU and existing TensorRT libraries; builds only tiny models"]
 fn compile_load_inference_and_strict_backend() -> Result<()> {
-    let root = std::env::temp_dir().join(format!("safe-inference-api-test-{}", std::process::id()));
+    let root = std::env::temp_dir().join(format!("native-onnx-api-test-{}", std::process::id()));
     std::fs::create_dir(&root)?;
     let source = root.join("source.onnx");
     let engine = root.join("compiled.ctx.onnx");
     std::fs::copy(fixture("linear.onnx"), &source)?;
     let options = OnnxOptions::default();
+    let compile = CompileOptions::new(CompileTarget::TensorRt(TensorRtOptions {
+        builder_optimization_level: 2,
+        fp16: true,
+        ..TensorRtOptions::default()
+    }));
     let x = [1.; 16];
     let input = TensorView::f32("x", &[1, 16], &x);
-    let compiled = OnnxRuntime::compile(&source, &engine, options.clone(), &[input])?;
+    let compiled = OnnxRuntime::compile(&source, &engine, compile.clone(), &[input])?;
     assert_eq!(compiled.backend, "TensorRT");
     assert_eq!(compiled.format, CompiledFormat::EpContext);
-    assert!(OnnxRuntime::compile(&source, &engine, options.clone(), &[input]).is_err());
+    assert!(OnnxRuntime::compile(&source, &engine, compile.clone(), &[input]).is_err());
     std::fs::remove_file(&source)?;
     // The only deployment artifact is the embedded engine; no manifest or source is needed.
     assert_eq!(std::fs::read_dir(&root)?.count(), 1);
@@ -47,7 +52,10 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     let compiled = OnnxRuntime::compile(
         fixture("linear.onnx"),
         &cuda_model,
-        cuda_options.clone(),
+        CompileOptions::new(CompileTarget::Cuda(CudaOptions {
+            tf32: false,
+            ..CudaOptions::default()
+        })),
         &[input],
     )?;
     assert_eq!(compiled.backend, "CUDA");
@@ -60,7 +68,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     // User owns engine/build-setting correspondence; loading ignores a different builder level.
     let mut changed = options.clone();
     changed.tensorrt = Some(TensorRtOptions {
-        builder_optimization_level: 2,
+        builder_optimization_level: 1,
         cuda_graph: false,
         ..TensorRtOptions::default()
     });
@@ -69,13 +77,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     drop(model);
     assert!(OnnxRuntime::load(&engine, OnnxOptions::cpu()).is_err());
     assert!(
-        OnnxRuntime::compile(
-            &engine,
-            root.join("invalid.ctx.onnx"),
-            options.clone(),
-            &[input]
-        )
-        .is_err()
+        OnnxRuntime::compile(&engine, root.join("invalid.ctx.onnx"), compile, &[input]).is_err()
     );
     // Contents decide the format, even if the extension changes.
     let renamed = root.join("compiled.bin");
@@ -122,6 +124,17 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     };
     let mut model = OnnxRuntime::load(&cpu_graph, auto)?;
     let values = [2., 1., 2., 1.];
+    let cpu_input = TensorView::f32("x", &[4], &values);
+    let unsupported_output = root.join("unsupported.onnx");
+    let error = OnnxRuntime::compile(
+        &cpu_graph,
+        &unsupported_output,
+        CompileOptions::new(CompileTarget::Cuda(CudaOptions::default())),
+        &[cpu_input],
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("Compile for CUDA"));
+    assert!(!unsupported_output.exists());
     assert_eq!(
         model.inference(&[TensorView::f32("x", &[4], &values)])?[0]
             .view()

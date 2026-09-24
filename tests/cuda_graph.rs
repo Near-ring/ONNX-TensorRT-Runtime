@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use safe_inference::{
+use native_onnx::{
     Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorView,
 };
 mod common;

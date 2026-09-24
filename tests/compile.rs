@@ -1,24 +1,31 @@
 #![forbid(unsafe_code)]
-use safe_inference::{
-    Backend, BackendSelection, CompiledFormat, CudaOptions, OnnxOptions, OnnxRuntime, Result,
-    TensorRtOptions, TensorView,
+use native_onnx::{
+    CompileOptions, CompileTarget, CompiledFormat, CudaOptions, OnnxOptions, OnnxRuntime, Result,
+    TensorData, TensorRtOptions, TensorView, ep,
 };
 mod common;
 use common::fixture;
 
+// A compilation request cannot obtain an implicit target through Default.
+static_assertions::assert_not_impl_any!(CompileOptions: Default);
+static_assertions::assert_not_impl_any!(CompileTarget: Default);
+
 #[test]
-fn cpu_compile_roundtrip_and_auto_fallback() -> Result<()> {
-    let root =
-        std::env::temp_dir().join(format!("safe-inference-cpu-compile-{}", std::process::id()));
+fn cpu_compile_roundtrip_and_output_validation() -> Result<()> {
+    let root = std::env::temp_dir().join(format!("native-onnx-cpu-compile-{}", std::process::id()));
     std::fs::create_dir_all(&root)?;
     let source = root.join("source.onnx");
     std::fs::copy(fixture("linear.onnx"), &source)?;
     let destination = root.join("cpu.onnx");
     let inputs = [TensorView::f32("x", &[1, 16], &[1.; 16])];
-    let result = OnnxRuntime::compile(&source, &destination, OnnxOptions::cpu(), &inputs)?;
+    let result = OnnxRuntime::compile(
+        &source,
+        &destination,
+        CompileOptions::new(CompileTarget::Cpu),
+        &inputs,
+    )?;
     assert_eq!(result.backend, "CPU");
     assert_eq!(result.format, CompiledFormat::OptimizedOnnx);
-    assert!(result.fallback_events.is_empty());
     std::fs::remove_file(&source)?;
     let mut loaded = OnnxRuntime::load(&destination, OnnxOptions::cpu())?;
     assert_eq!(loaded.inference(&inputs)?[0].view().as_f32()?, &[16.; 16]);
@@ -28,47 +35,19 @@ fn cpu_compile_roundtrip_and_auto_fallback() -> Result<()> {
         OnnxRuntime::compile(
             fixture("linear.onnx"),
             &destination,
-            OnnxOptions::cpu(),
+            CompileOptions::new(CompileTarget::Cpu),
             &inputs
         )
         .is_err()
     );
     assert_eq!(before, std::fs::read(&destination)?);
-    let invalid_trt = TensorRtOptions {
-        workspace_bytes: 0,
-        ..TensorRtOptions::default()
-    };
-    let invalid_cuda = CudaOptions {
-        device_id: -1,
-        ..CudaOptions::default()
-    };
-    let automatic = OnnxOptions {
-        tensorrt: Some(invalid_trt.clone()),
-        cuda: Some(invalid_cuda),
-        ..OnnxOptions::default()
-    };
-    let result = OnnxRuntime::compile(
-        fixture("linear.onnx"),
-        root.join("auto.onnx"),
-        automatic,
-        &inputs,
-    )?;
-    assert_eq!(result.backend, "CPU");
-    assert_eq!(result.fallback_events.len(), 2);
-    let required = OnnxOptions {
-        backend: BackendSelection::Require(Backend::TensorRt),
-        tensorrt: Some(invalid_trt),
-        ..OnnxOptions::default()
-    };
     let failed = root.join("failed.onnx");
-    assert!(OnnxRuntime::compile(fixture("linear.onnx"), &failed, required, &inputs).is_err());
-    assert!(!failed.exists());
     let bad_input = [TensorView::f32("wrong", &[1], &[0.])];
     assert!(
         OnnxRuntime::compile(
             fixture("linear.onnx"),
             &failed,
-            OnnxOptions::cpu(),
+            CompileOptions::new(CompileTarget::Cpu),
             &bad_input
         )
         .is_err()
@@ -79,9 +58,89 @@ fn cpu_compile_roundtrip_and_auto_fallback() -> Result<()> {
 }
 
 #[test]
+fn compile_rejects_invalid_target_settings_without_fallback() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let inputs = [TensorView::f32("x", &[1, 16], &[1.; 16])];
+    for (target, expected) in [
+        (
+            CompileTarget::TensorRt(TensorRtOptions {
+                workspace_bytes: 0,
+                ..TensorRtOptions::default()
+            }),
+            "Workspace must be positive",
+        ),
+        (
+            CompileTarget::Cuda(CudaOptions {
+                device_id: -1,
+                ..CudaOptions::default()
+            }),
+            "Negative CUDA device id",
+        ),
+    ] {
+        let destination = root.path().join("failed.onnx");
+        let error = OnnxRuntime::compile(
+            fixture("linear.onnx"),
+            &destination,
+            CompileOptions::new(target),
+            &inputs,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains(expected), "{error:#}");
+        assert!(!destination.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn compile_accepts_a_configured_custom_provider() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("custom.onnx");
+    let inputs = [TensorView::f32("x", &[1, 16], &[1.; 16])];
+    let result = OnnxRuntime::compile(
+        fixture("linear.onnx"),
+        &destination,
+        CompileOptions::new(CompileTarget::Custom {
+            name: "Configured CPU".into(),
+            provider: ep::CPU::default().with_arena_allocator(false).build(),
+        }),
+        &inputs,
+    )?;
+    assert_eq!(result.backend, "Configured CPU");
+    let mut model = OnnxRuntime::load(destination, OnnxOptions::cpu())?;
+    assert_eq!(model.inference(&inputs)?[0].view().as_f32()?, &[16.; 16]);
+    Ok(())
+}
+
+#[test]
+fn compile_applies_dimension_overrides() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let destination = root.path().join("fixed.onnx");
+    let values = [1_i64, 2, 3, 4, 5, 6];
+    let inputs = [TensorView {
+        name: "tokens",
+        shape: &[2, 3],
+        data: TensorData::I64(&values),
+    }];
+    let mut options = CompileOptions::new(CompileTarget::Cpu);
+    options.intra_threads = 2;
+    options.inter_threads = 2;
+    options.parallel_execution = true;
+    options.dimension_overrides.insert("batch".into(), 2);
+    OnnxRuntime::compile(fixture("dynamic.onnx"), &destination, options, &inputs)?;
+    let mut model = OnnxRuntime::load(destination, OnnxOptions::cpu())?;
+    assert_eq!(model.info().inputs[0].fixed_shape(), Some(vec![2, 3]));
+    let outputs = model.inference(&inputs)?;
+    let TensorData::I64(output) = outputs[0].view().data else {
+        panic!("Expected an i64 output");
+    };
+    assert_eq!(output, &values);
+    Ok(())
+}
+
+#[test]
 fn compiled_cpu_model_does_not_depend_on_external_source_weights() -> Result<()> {
     let root = std::env::temp_dir().join(format!(
-        "safe-inference-external-compile-{}",
+        "native-onnx-external-compile-{}",
         std::process::id()
     ));
     let source_directory = root.join("source");
@@ -92,11 +151,16 @@ fn compiled_cpu_model_does_not_depend_on_external_source_weights() -> Result<()>
     let mut reference = OnnxRuntime::load(&source, OnnxOptions::cpu())?;
     let info = reference.info().clone();
     let shape = info.inputs[0].fixed_shape().unwrap();
-    let values = vec![1.; safe_inference::element_count(&shape)?];
+    let values = vec![1.; native_onnx::element_count(&shape)?];
     let inputs = [TensorView::f32(&info.inputs[0].name, &shape, &values)];
     let expected = reference.inference(&inputs)?;
     let destination = root.join("compiled.onnx");
-    OnnxRuntime::compile(&source, &destination, OnnxOptions::cpu(), &inputs)?;
+    OnnxRuntime::compile(
+        &source,
+        &destination,
+        CompileOptions::new(CompileTarget::Cpu),
+        &inputs,
+    )?;
     drop(reference);
     std::fs::remove_dir_all(source_directory)?;
     let mut model = OnnxRuntime::load(&destination, OnnxOptions::cpu())?;

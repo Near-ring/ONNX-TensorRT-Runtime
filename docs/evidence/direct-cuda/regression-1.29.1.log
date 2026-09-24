@@ -1,9 +1,0 @@
-    Finished `release` profile [optimized] target(s) in 0.06s
-     Running tests/copy_cache.rs (target/release/deps/copy_cache-df7c62fb326f3ce8)
-
-running 1 test
-600 checked forwards, 6 sessions, zero copy helpers; CUDA graphs on/off
-test gpu_copy_cache_stays_bounded_across_runs_and_session_drops ... ok
-
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.79s
-

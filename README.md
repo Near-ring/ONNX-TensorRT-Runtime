@@ -1,215 +1,174 @@
-# Inference
+# native-onnx
 
-Safe Rust ONNX inference using an existing ONNX Runtime installation. The API has three steps:
-`compile`, `load`, and `inference`. Compilation is optional when loading an ordinary ONNX model.
+Rust ONNX inference using **your system's ONNX Runtime, CUDA, and TensorRT**.
+Load a model, supply typed tensors, and choose a required backend or ordered fallback.
+No Python runtime or automatic native-library downloads.
+
+## Why use it?
+
+- **Less repeated work:** reuse input/output buffers; GPU paths reuse pinned host
+  and device storage. Eligible fixed-shape models can use CUDA graph replay.
+- **Faster startup after compilation:** compile a TensorRT model once, then load
+  its embedded engine on later launches.
+- **Explicit execution:** require CUDA/TensorRT or allow fallback to CPU, with
+  recorded failure reasons and checked tensor names, types, shapes, and lengths.
+
+Compute speed comes from ONNX Runtime and its native providers. This crate reduces
+buffer setup and allocation work; it does **not** promise a universal speedup over
+`ort`, C++, or Python. Benchmark your model and hardware.
+
+## Install the native libraries first
+
+Requires **Rust 1.88+** and a matching native runtime for your process architecture.
+**You must install these system libraries yourself:**
+
+| Execution | Required installation |
+|---|---|
+| CPU | ONNX Runtime **1.27+** shared library (C API 27); no NVIDIA libraries needed |
+| CUDA | ONNX Runtime **1.27+ with CUDA EP**; standard GPU builds require **CUDA 13.x (13.0+)**, **cuDNN 9.x for CUDA 13**, and an NVIDIA driver supporting CUDA 13 (**R580+**) |
+| TensorRT | The GPU stack above plus the **TensorRT version required by your ORT build**. The validated baseline is **TensorRT 10.15.1 (ABI 10)**; a newer incompatible major version will not work |
+| CoreML | macOS **12+** and ONNX Runtime **1.27+ with CoreML EP** |
+
+GPU dependency versions must match the installed ORT build, not merely exceed a
+number. Custom CUDA 12 builds need their matching CUDA/cuDNN/TensorRT libraries.
+Validated on Linux with ORT 1.29.1, CUDA 13, cuDNN 9.20, and TensorRT 10.15.1;
+macOS and Windows still need native validation on those platforms.
+For that Linux stack, the [cuDNN driver minimum is 580.65.06](https://docs.nvidia.com/deeplearning/cudnn/backend/v9.20.0/reference/support-matrix.html).
+See [ORT installation](https://onnxruntime.ai/docs/install/),
+[CUDA requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html),
+and [TensorRT compatibility](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/getting-started/release-notes-10/10.15.1.html).
+
+On Linux, set the paths **before launching** your application:
+
+```bash
+export ORT_DYLIB_PATH=/opt/onnxruntime/lib/libonnxruntime.so
+# GPU only: replace these with your actual native-library directories.
+export LD_LIBRARY_PATH=/opt/onnxruntime/lib:/usr/local/cuda/lib64:/opt/cudnn/lib:/opt/tensorrt/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+```
+
+On Windows, point `ORT_DYLIB_PATH` to `onnxruntime.dll` and add the dependency
+folders to `PATH`. On macOS, use `libonnxruntime.dylib`. You can also set
+`OnnxOptions::runtime_path`; the first ORT initialization selects the library for
+the entire process. Missing/incompatible libraries return installation guidance;
+print errors with `eprintln!("{error:#}")` to include the native loader's cause.
+
+## Basic example
+
+```toml
+[dependencies]
+native-onnx = "0.1.0"
+```
+
+For a model with an FP32 input named `x`, shape `[1, 16]`:
 
 ```rust,no_run
-use safe_inference::{Backend, BackendSelection, OnnxOptions, OnnxRuntime, TensorView};
+use native_onnx::{OnnxOptions, OnnxRuntime, Result, TensorView};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let image_buffer = vec![0.0_f32; 3 * 640 * 640];
-    let input = TensorView::f32("images", &[1, 3, 640, 640], &image_buffer);
-    let options = OnnxOptions {
-        backend: BackendSelection::Require(Backend::TensorRt),
-        ..OnnxOptions::default()
-    };
+fn main() -> Result<()> {
+    let mut model = OnnxRuntime::load("model.onnx", OnnxOptions::cpu())?;
+    let values = [1.0_f32; 16];
+    let input = TensorView::f32("x", &[1, 16], &values);
 
-    // Compile once. Produces a single file with the TensorRT engine embedded.
-    OnnxRuntime::compile("models/yolo11m.onnx", "models/yolo11m.ctx.onnx",
-        options.clone(), &[input])?;
-
-    // Later launches start here; the original ONNX file is no longer needed.
-    let mut model = OnnxRuntime::load("models/yolo11m.ctx.onnx", options)?;
-    let outputs = model.inference(&[input])?;
-    println!("{:?}", outputs[0].shape);
+    for output in model.inference(&[input])? {
+        println!("{}: {:?}", output.name, output.shape);
+    }
     Ok(())
 }
 ```
 
-## Compile
+Replace the path, name, shape, and values for your model. `model.info()` exposes
+its specifications. Input storage is contiguous and row-major; preprocessing and
+postprocessing belong in your application.
 
-`OnnxRuntime::compile(source, destination, options, inputs)` honors backend selection and returns
-`Compilation { backend, format, fallback_events }`. Compilation is a common API; each provider
-chooses the representation it can export:
-
-| Backend | Compilation output |
-|---|---|
-| TensorRT | Embedded `EPContext` containing a native engine; builder level **3** by default |
-| CPU / CUDA | Optimized ONNX graph through ORT's `ModelCompiler` |
-| Custom providers, including OpenVINO | ORT's `ModelCompiler`, when supported by the installed provider; otherwise an error |
-
-CPU, CUDA, and TensorRT round trips are tested here. OpenVINO/custom native compilation has not
-been tested or installed. Unsupported export returns an error; the API does not promise every
-provider produces a native engine. An optimized CPU/CUDA graph still requires its runtime and
-compatible execution options at load time; it is not a TensorRT plan.
-
-`Require(backend)` compiles for exactly that provider. `Auto([...])` attempts candidates in order,
-including retrying after compilation/export/validation failures. Each candidate must support the
-whole graph: compilation does not quietly package a CPU fallback under another provider's name.
-The returned `backend` and `format` tell the caller what was actually produced. TensorRT export
-currently requires a single partition. Every artifact is reopened and run with the supplied
-representative inputs before publication. An existing destination is an error; temporary build
-files are cleaned up.
+## Select a GPU and compile once
 
 ```rust,no_run
-use safe_inference::{OnnxOptions, OnnxRuntime, TensorView};
-let input = TensorView::f32("x", &[1, 16], &[1.; 16]);
-let options = OnnxOptions::cpu();
-let result = OnnxRuntime::compile("linear.onnx", "linear.cpu.onnx", options.clone(), &[input])?;
-println!("{}: {:?}", result.backend, result.format);
-let mut model = OnnxRuntime::load("linear.cpu.onnx", options)?;
-let output = model.inference(&[input])?;
-# Ok::<(), safe_inference::Error>(())
-```
-
-Use the intended backend and compatible settings when loading optimized graphs; `load` does not
-record or check which backend originally compiled them. There are no model/engine correspondence
-checks, hashes, manifests, deployment fingerprints, or automatic invalidation. The caller decides
-when to recompile. Native providers still perform their own deserialization checks.
-
-The two reported formats are `CompiledFormat::OptimizedOnnx` and `CompiledFormat::EpContext`.
-Both are ONNX files; `.ctx.onnx` is a convention for embedded contexts, while raw TensorRT `.engine`
-files are not accepted. See [ORT compilation and EPContext documentation](https://onnxruntime.ai/docs/execution-providers/EP-Context-Design.html#compile-api)
-and [offline graph optimization](https://onnxruntime.ai/docs/performance/model-optimizations/graph-optimizations.html#onlineoffline-mode).
-
-## Load and backend selection
-
-`OnnxRuntime::load(path, options)` detects EPContext nodes from the file contents, regardless of
-its extension:
-
-| Input | Behavior |
-|---|---|
-| Ordinary ONNX graph | Configure the requested provider(s), then create a session |
-| Compiled EPContext | Load with a compatible configured provider; never rebuild the original graph |
-
-Loading an ordinary ONNX graph with TensorRT builds an in-memory engine. To avoid repeated builds,
-compile explicitly and load the resulting `.ctx.onnx` on later launches, or set
-`ORT_TENSORRT_CACHE_PATH` before launching to persist ONNX Runtime's TensorRT
-engine cache across launches. Cache files depend on the model, runtime, TensorRT
-version, and GPU; rebuild them when that environment changes.
-
-```rust,no_run
-use safe_inference::{Backend, BackendSelection, OnnxOptions, OnnxRuntime};
-
-// Require CUDA: registration, node placement, or inference failure returns an error.
-let strict = OnnxOptions {
-    backend: BackendSelection::Require(Backend::Cuda),
-    ..OnnxOptions::default()
+use native_onnx::{
+    Backend, BackendSelection, CompileOptions, CompileTarget, OnnxOptions,
+    OnnxRuntime, TensorRtOptions, TensorView,
 };
-let model = OnnxRuntime::load("model.onnx", strict)?;
 
-// Allow automatic fallback, in the given order.
-let automatic = OnnxOptions {
-    backend: BackendSelection::Auto(vec![Backend::TensorRt, Backend::Cuda, Backend::Cpu]),
-    ..OnnxOptions::default()
+let config = TensorRtOptions {
+    fp16: true,
+    ..TensorRtOptions::default()
 };
-let model = OnnxRuntime::load("model.onnx", automatic)?;
-# Ok::<(), safe_inference::Error>(())
-```
+let compile = CompileOptions::new(CompileTarget::TensorRt(config.clone()));
+let values = [1.0_f32; 16];
+let input = TensorView::f32("x", &[1, 16], &values);
 
-`Require` disables ORT's implicit CPU node fallback for non-CPU providers and never switches
-providers on an inference error. `Auto` permits ORT node partitioning (including CPU fallback),
-and tries the next candidate if whole-session creation or inference fails. Invalid input tensors
-return errors without triggering fallback. `backend()` reports the primary provider;
-`fallback_events()` records whole-session failures. In automatic mode, the primary provider does
-not imply every node executes there. `OnnxOptions::cpu()` requires CPU.
+// Run once. The destination must not already exist.
+OnnxRuntime::compile("model.onnx", "model.ctx.onnx", compile, &[input])?;
 
-A compiled context needs its native provider. `Auto` can try the configured providers to find one
-that can load it, but a context cannot turn into a different backend's engine. Inference errors on
-compiled contexts are returned directly. Load the original graph explicitly for a different backend.
-A TensorRT context cannot execute through CPU/CUDA alone; the same principle applies to other EPs.
-
-Additional installed ORT providers use `Backend::Custom { name, provider }`. Cargo features
-`openvino`, `directml`, and `coreml` expose ORT configuration; they do not install native backends.
-For example, with `--features openvino`:
-
-```rust,no_run
-use safe_inference::{Backend, BackendSelection, OnnxOptions, ep};
+// Later launches start here; the original model is not needed.
 let options = OnnxOptions {
-    backend: BackendSelection::Require(Backend::Custom {
-        name: "OpenVINO".into(),
-        provider: ep::OpenVINO::default().build(),
-    }),
+    backend: BackendSelection::Require(Backend::TensorRt),
+    tensorrt: Some(config),
     ..OnnxOptions::default()
 };
+let mut model = OnnxRuntime::load("model.ctx.onnx", options)?;
+let outputs = model.inference(&[input])?;
+# Ok::<(), native_onnx::Error>(())
 ```
 
-## Provider options
+Compilation requires an explicit target and its settings: `CompileTarget::TensorRt(config)`,
+`CompileTarget::Cuda(config)`, or `CompileTarget::Cpu`. `CompileOptions::new(target)`
+also exposes threading, runtime path, and dimension overrides. It has no default
+target or fallback; the artifact is validated with your inputs before saving.
 
-`OnnxOptions` contains common settings and two optional provider configurations:
+For **loading/inference**, use `Require(Backend::Cuda)` for CUDA. Use
+`Auto(vec![Backend::TensorRt, Backend::Cuda, Backend::Cpu])` to permit fallback.
+`backend()` reports the primary provider; in automatic mode some nodes can run on
+CPU. `fallback_events()` reports whole-session failures. `Require` rejects CPU
+node fallback.
 
-```rust,no_run
-use safe_inference::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtOptions};
+TensorRT export currently requires one partition. CPU/CUDA compilation produces
+an optimized ONNX graph. Compiled contexts require their native provider; they
+cannot fall back to a CPU engine. Recompile after changing the model, GPU, or
+incompatible runtime/provider settings. Raw TensorRT `.engine` files are not accepted.
 
-let options = OnnxOptions {
-    backend: BackendSelection::Require(Backend::Cuda),
-    cuda: Some(CudaOptions { device_id: 0, tf32: false, cuda_graph: true }),
-    tensorrt: None,
-    ..OnnxOptions::default()
-};
+## Reuse buffers and configure execution
 
-let options = OnnxOptions {
-    tensorrt: Some(TensorRtOptions {
-        builder_optimization_level: 3,
-        fp16: true,
-        tf32: true,
-        cuda_graph: true,
-        ..TensorRtOptions::default()
-    }),
-    ..OnnxOptions::default()
-};
-```
-
-Both fields default to `None`: the selected provider uses its default settings. `None` means no
-customization, not a disabled backend; `backend` controls selection. CPU/OpenVINO/custom providers
-ignore both configurations. Validation occurs only when a provider is used, so unused GPU options
-do not block another backend. Each built-in GPU provider has its own `device_id` (default 0).
-
-TensorRT's FP16, TF32, CUDA graphs, builder level, workspace, sparsity, auxiliary streams, and
-shape profiles belong to `TensorRtOptions`. Set `ORT_TENSORRT_CACHE_PATH` for its engine cache.
-CUDA's TF32, device ID, and opt-in CUDA graph setting belong to `CudaOptions`.
-CUDA graphs use persistent bindings when all graph inputs and outputs have fixed, positive
-shapes and supported dense tensor types. Other graph I/O runs with CUDA graphs disabled.
-Capture still requires all nodes to be eligible for the chosen GPU provider. The CUDA
-default is `cuda_graph: false`.
-Custom providers carry their own configuration in `Backend::Custom::provider`.
-
-## Inference and buffers
-
-| API | Ownership |
+| API / option | Purpose |
 |---|---|
-| `inference(inputs)` | Borrow input slices, return owned CPU output tensors |
-| `inference_into(inputs, outputs)` | Write into caller-owned output buffers |
-| `input_mut(name)`, `run()`, `output(name)` | Reuse persistent input/output buffers |
-| `info()` | Input/output names, data types, and dimensions |
+| `inference(inputs)` | Borrow inputs and return owned CPU outputs |
+| `inference_into(inputs, outputs)` | Fill caller-owned outputs |
+| `input_mut(name)`, `run()`, `output(name)` | Reuse fixed-shape buffers; inputs start at zero |
+| `CudaOptions`, `TensorRtOptions` | Device, precision, CUDA graphs, and TensorRT profiles |
+| `dimension_overrides` | Resolve named dynamic dimensions |
+| `parallel_execution`, `inter_threads` | Enable/configure inter-operator CPU parallelism |
 
-Dense, contiguous row-major tensors support FP32, FP64, FP16, BF16, signed and unsigned
-8/16/32/64-bit integers, and bool.
-Models may have multiple inputs/outputs and dynamic dimensions. For fixed, positive shapes,
-prepared storage reuses pinned host buffers, device tensors, and I/O bindings across runs.
-Dynamic shapes use ordinary ORT runs. `inference` allocates owned outputs;
-use `inference_into` or borrowed `output` to avoid those allocations on the prepared path.
+CUDA graphs require eligible fixed-shape I/O and sequential execution. CUDA's
+capture option defaults off; TensorRT's defaults on. TensorRT defaults to FP32
+with TF32 allowed; unset `NVIDIA_TF32_OVERRIDE`, or set it to `0` with `tf32: false`.
+Dynamic or unknown-rank I/O uses ordinary inference. Dense numeric and boolean
+tensors are supported; strings, sequences, and sparse I/O are not.
 
-TensorRT defaults to FP16 disabled and TF32 enabled, with FP32 I/O where defined by the model,
-4 GiB TensorRT workspace, builder level 3, sparsity, CUDA graphs for eligible static I/O,
-ORT graph optimization level 3, and one intra/inter-op thread. `dimensions` resolves symbolic
-ONNX dimensions; `TensorRtOptions::{min_shapes, opt_shapes, max_shapes}` configure dynamic profiles.
-For TensorRT, unset `NVIDIA_TF32_OVERRIDE` for `tf32 = true`; set it to `0` for `tf32 = false`.
-The TensorRT EP has no TF32 provider option; the API validates the process setting so the
-requested configuration cannot silently be overridden.
-CUDA's `CudaOptions::tf32` is configured separately through its provider API.
+Calls are synchronous. `OnnxRuntime` is neither `Send` nor `Sync`: construct one
+inside each inference worker. Native provider crashes cannot be recovered as Rust
+errors. Additional providers use `Backend::Custom`; enable the `openvino` feature
+for OpenVINO configuration and install its matching native provider separately.
 
-Unsafe code is restricted to the private CUDA transfer module. ORT and its native providers use native code, which can crash;
-safe Rust cannot turn a native process crash into a recoverable `Result`. Methods are synchronous.
-`OnnxRuntime` is neither `Send` nor `Sync`; construct a separate instance inside each
-concurrent inference worker.
+The pinned `ort` rc.13 dependency has an [exit-time CUDA teardown bug](https://github.com/pykeio/ort/issues/609).
+This crate retains one global environment until process exit as a workaround;
+model sessions and buffers are still released when dropped.
 
-## GPU copy-cache fix
+## Development
 
-The engine bypasses an `ort` tensor-copy cache lifetime bug with direct CUDA
-transfers between persistent pinned host buffers and device buffers. It uses
-the unmodified registry `ort` crate; unsafe FFI is isolated in
-`src/cuda_transfer.rs`. The fix applies to `inference()`, `inference_into()`, and `run()`, including CUDA graph replay
-and repeated session creation. No extra cleanup call is required. See
-[scope, validation, and dependency maintenance](docs/ort-copy-cache-fix.md).
+With `ORT_DYLIB_PATH` configured:
 
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+cargo publish --dry-run
+# On a GPU host with the matching native libraries:
+cargo test --tests -- --ignored
+```
+
+The crate archive includes only engine source, build script, README, license,
+and Cargo metadata. Tests stay in Git; local examples, experiments, and model
+assets are ignored.
+
+Licensed under [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0).
+See `LICENSE-APACHE` for the full text.

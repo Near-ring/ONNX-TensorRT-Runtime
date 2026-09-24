@@ -1,11 +1,11 @@
 //! Regression for copy helpers retaining dangling allocator-name cache keys.
 #![forbid(unsafe_code)]
 
-use ort::{environment::Environment, logging::LogLevel};
-use safe_inference::{
+use native_onnx::{
     Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorView,
     TensorViewMut,
 };
+use ort::{environment::Environment, logging::LogLevel};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},

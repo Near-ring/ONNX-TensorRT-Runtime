@@ -1,14 +1,13 @@
 #![deny(unsafe_code)]
-//! ONNX inference with explicit TensorRT compilation and selectable provider fallback.
-//! Use [`OnnxRuntime::inference_into`] for caller-owned outputs, or
-//! [`OnnxRuntime::input_mut`], [`OnnxRuntime::run`], and [`OnnxRuntime::output`]
-//! for persistent input buffers and borrowed outputs.
+#![warn(missing_docs)]
+#![doc = include_str!("../README.md")]
 
 mod api;
 mod buffers;
 // The only engine module allowed to call the dynamically loaded CUDA driver.
 #[allow(unsafe_code)]
 mod cuda_transfer;
+mod diagnostics;
 mod engine;
 mod options;
 mod session;
@@ -16,7 +15,10 @@ mod tensor;
 
 pub use anyhow::{Error, Result};
 pub use api::{Compilation, CompiledFormat, FallbackEvent, ModelInfo, OnnxRuntime};
-pub use options::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtOptions};
+pub use options::{
+    Backend, BackendSelection, CompileOptions, CompileTarget, CudaOptions, OnnxOptions,
+    TensorRtOptions,
+};
 /// Configure additional installed ONNX Runtime providers through [`Backend::Custom`].
 pub use ort::ep;
 pub use tensor::{

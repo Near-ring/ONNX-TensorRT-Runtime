@@ -1,6 +1,6 @@
 //! Detect provider context models and export TensorRT engines in the EPContext format.
-use crate::{DType, ModelInfo, Result, TensorSpec};
-use anyhow::{Context, ensure};
+use crate::{DType, ModelInfo, OnnxOptions, Result, TensorSpec};
+use anyhow::{Context, bail, ensure};
 use onnx_rs::ast::{
     Attribute, AttributeType, DataType, Dimension, Graph, Model, Node, OpType, OperatorSetId,
     TensorShape, TensorShapeDimension, TensorTypeProto, TypeProto, TypeValue, ValueInfo,
@@ -10,34 +10,88 @@ use std::{collections::BTreeSet, fs, path::Path};
 #[derive(Clone, Copy)]
 pub(crate) enum ModelFormat {
     Onnx,
-    EpContext { static_io: bool },
+    EpContext,
 }
 
 /// Detect compiled wrappers from their contents, regardless of the file extension.
-pub(crate) fn inspect(path: &Path) -> Result<ModelFormat> {
-    let bytes = fs::read(path)?;
-    let model = onnx_rs::parse(&bytes)?;
+pub(crate) fn inspect(path: &Path, options: &OnnxOptions) -> Result<(ModelFormat, ModelInfo)> {
+    let bytes = fs::read(path).with_context(|| format!("Read model {}", path.display()))?;
+    let model =
+        onnx_rs::parse(&bytes).with_context(|| format!("Parse ONNX model {}", path.display()))?;
     let graph = model.graph.context("Missing ONNX graph")?;
-    let compiled = graph
+    let is_ep_context = graph
         .node
         .iter()
         .any(|node| node.domain == "com.microsoft" && node.op_type == OpType::Custom("EPContext"));
-    let static_io = !graph.input.is_empty()
-        && !graph.output.is_empty()
-        && graph.input.iter().chain(&graph.output).all(|value| {
-            matches!(value.r#type.as_ref().and_then(|t| t.value.as_ref()),
-                Some(TypeValue::Tensor(t)) if matches!(t.elem_type,
-                    DataType::Float | DataType::Double | DataType::Float16 | DataType::Bfloat16 |
-                    DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 |
-                    DataType::Uint64 | DataType::Uint32 | DataType::Uint16 | DataType::Uint8 |
-                    DataType::Bool)
-                    && t.shape.as_ref().is_some_and(|s| s.dim.iter().all(|d|
-                        matches!(d.value, Dimension::Value(n) if n > 0))))
-        });
-    Ok(if compiled {
-        ModelFormat::EpContext { static_io }
+    // Reading protobuf metadata must not instantiate a CPU session: some valid
+    // models (for example BF16 Add) have kernels only in the selected GPU provider.
+    let initialized = graph
+        .initializer
+        .iter()
+        .map(|t| t.name())
+        .chain(
+            graph
+                .sparse_initializer
+                .iter()
+                .filter_map(|t| t.values.as_ref().map(|v| v.name())),
+        )
+        .collect::<BTreeSet<_>>();
+    let info = ModelInfo {
+        inputs: graph
+            .input
+            .iter()
+            .filter(|v| !initialized.contains(v.name))
+            .map(|v| tensor_spec(v, options))
+            .collect::<Result<_>>()?,
+        outputs: graph
+            .output
+            .iter()
+            .map(|v| tensor_spec(v, options))
+            .collect::<Result<_>>()?,
+    };
+    let format = if is_ep_context {
+        ModelFormat::EpContext
     } else {
         ModelFormat::Onnx
+    };
+    Ok((format, info))
+}
+
+fn tensor_spec(value: &ValueInfo<'_>, options: &OnnxOptions) -> Result<TensorSpec> {
+    let Some(TypeValue::Tensor(tensor)) = value.r#type.as_ref().and_then(|t| t.value.as_ref())
+    else {
+        bail!("Only dense tensor I/O is supported: {}", value.name);
+    };
+    let dtype = match tensor.elem_type {
+        DataType::Float => DType::F32,
+        DataType::Double => DType::F64,
+        DataType::Float16 => DType::F16,
+        DataType::Bfloat16 => DType::BF16,
+        DataType::Int64 => DType::I64,
+        DataType::Int32 => DType::I32,
+        DataType::Int16 => DType::I16,
+        DataType::Int8 => DType::I8,
+        DataType::Uint64 => DType::U64,
+        DataType::Uint32 => DType::U32,
+        DataType::Uint16 => DType::U16,
+        DataType::Uint8 => DType::U8,
+        DataType::Bool => DType::Bool,
+        dtype => bail!("Unsupported I/O dtype {dtype:?}: {}", value.name),
+    };
+    let shape = tensor.shape.as_ref().map(|shape| {
+        shape
+            .dim
+            .iter()
+            .map(|d| match d.value {
+                Dimension::Value(n) => usize::try_from(n).ok(),
+                Dimension::Param(name) => options.dimension_overrides.get(name).copied(),
+            })
+            .collect()
+    });
+    Ok(TensorSpec {
+        name: value.name.into(),
+        dtype,
+        shape,
     })
 }
 
@@ -59,6 +113,8 @@ fn value<'a>(spec: &'a TensorSpec, symbols: &'a [String]) -> Result<ValueInfo<'a
     };
     let dim = spec
         .shape
+        .as_deref()
+        .unwrap_or_default()
         .iter()
         .zip(symbols)
         .map(|(n, symbol)| {
@@ -76,7 +132,7 @@ fn value<'a>(spec: &'a TensorSpec, symbols: &'a [String]) -> Result<ValueInfo<'a
         r#type: Some(TypeProto {
             value: Some(TypeValue::Tensor(TensorTypeProto {
                 elem_type,
-                shape: Some(TensorShape { dim }),
+                shape: spec.shape.as_ref().map(|_| TensorShape { dim }),
             })),
             ..Default::default()
         }),
@@ -153,7 +209,7 @@ pub(crate) fn export_from_profile(
         .iter()
         .chain(&info.outputs)
         .map(|s| {
-            (0..s.shape.len())
+            (0..s.shape.as_ref().map_or(0, Vec::len))
                 .map(|i| format!("{}_d{i}", s.name))
                 .collect::<Vec<_>>()
         })
@@ -171,7 +227,7 @@ pub(crate) fn export_from_profile(
     let output = values.collect::<Result<_>>()?;
     let model = Model {
         ir_version: 8,
-        producer_name: "safe-inference",
+        producer_name: "native-onnx",
         opset_import: vec![
             OperatorSetId {
                 domain: "",
@@ -195,30 +251,16 @@ pub(crate) fn export_from_profile(
 }
 
 /// Isolated scratch space for an explicit compilation; no persistent cache or identity record.
-pub(crate) struct BuildDirectory(std::path::PathBuf);
+pub(crate) struct BuildDirectory(tempfile::TempDir);
 impl BuildDirectory {
     pub fn new() -> Result<Self> {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static NEXT: AtomicU64 = AtomicU64::new(0);
-        loop {
-            let path = std::env::temp_dir().join(format!(
-                "safe-inference-compile-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error.into()),
-            }
-        }
+        Ok(Self(
+            tempfile::Builder::new()
+                .prefix("native-onnx-compile-")
+                .tempdir()?,
+        ))
     }
     pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
-impl Drop for BuildDirectory {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        self.0.path()
     }
 }

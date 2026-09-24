@@ -1,8 +1,10 @@
 //! ORT initialization, provider registration, session creation, and tensor conversion.
 use crate::buffers::{self, InferenceBuffers};
-use crate::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtOptions};
+use crate::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtOptions, diagnostics};
 use crate::{DType, ModelInfo, Result, Tensor, TensorBuffer, TensorData, TensorSpec, TensorView};
 use anyhow::{Context, bail, ensure};
+#[cfg(target_os = "macos")]
+use ort::ep::{CoreML, coreml::ModelFormat as CoreMlModelFormat};
 use ort::{
     ep::{CPU, CUDA, TensorRT},
     session::{
@@ -11,7 +13,17 @@ use ort::{
     },
     value::{DynValue, TensorElementType, TensorRef, ValueType},
 };
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
+};
+
+// ort rc.13's .fini_array hook can call ReleaseEnv after CUDA's C++ teardown,
+// causing use-after-free at process exit (https://github.com/pykeio/ort/issues/609).
+// Keep exactly one environment reference until the OS reclaims the process.
+// Session/buffer allocations still drop normally; nothing is retained per model.
+// Revisit when a crates.io ort release includes the manual-environment API (#610).
+static ENVIRONMENT: OnceLock<Arc<ort::environment::Environment>> = OnceLock::new();
 
 fn ort_error(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{error}")
@@ -32,8 +44,12 @@ pub(super) fn initialize(options: &OnnxOptions) -> Result<()> {
             .into()
         });
     ort::init_from(&path)
-        .with_context(|| format!("Load existing ORT runtime {}", path.display()))?
+        .map_err(|error| diagnostics::runtime_error(&path, error))?
         .commit();
+    if ENVIRONMENT.get().is_none() {
+        let environment = ort::environment::Environment::current()?;
+        let _ = ENVIRONMENT.set(environment);
+    }
     Ok(())
 }
 
@@ -45,9 +61,11 @@ fn builder(options: &OnnxOptions, profiling: bool) -> Result<SessionBuilder> {
         .map_err(ort_error)?
         .with_inter_threads(options.inter_threads)
         .map_err(ort_error)?
+        .with_parallel_execution(options.parallel_execution)
+        .map_err(ort_error)?
         .with_optimization_level(GraphOptimizationLevel::Level3)
         .map_err(ort_error)?;
-    for (name, size) in &options.dimensions {
+    for (name, size) in &options.dimension_overrides {
         session_builder = session_builder
             .with_dimension_override(name, *size as i64)
             .map_err(ort_error)?;
@@ -106,8 +124,8 @@ fn check_tf32(enabled: bool) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn metadata(session: &Session) -> Result<ModelInfo> {
-    fn specs(outlets: &[ort::value::Outlet]) -> Result<Vec<TensorSpec>> {
+fn metadata(session: &Session, declared: &ModelInfo) -> Result<ModelInfo> {
+    fn specs(outlets: &[ort::value::Outlet], declared: &[TensorSpec]) -> Result<Vec<TensorSpec>> {
         outlets
             .iter()
             .map(|outlet| {
@@ -133,14 +151,23 @@ pub(super) fn metadata(session: &Session) -> Result<ModelInfo> {
                 Ok(TensorSpec {
                     name: outlet.name().into(),
                     dtype,
-                    shape: shape.iter().map(|&d| usize::try_from(d).ok()).collect(),
+                    // ORT exposes unknown rank and scalar rank as the same empty
+                    // shape. Keep that distinction from the original ONNX graph.
+                    shape: if declared
+                        .iter()
+                        .any(|s| s.name == outlet.name() && s.shape.is_none())
+                    {
+                        None
+                    } else {
+                        Some(shape.iter().map(|&d| usize::try_from(d).ok()).collect())
+                    },
                 })
             })
             .collect()
     }
     Ok(ModelInfo {
-        inputs: specs(session.inputs())?,
-        outputs: specs(session.outputs())?,
+        inputs: specs(session.inputs(), &declared.inputs)?,
+        outputs: specs(session.outputs(), &declared.outputs)?,
     })
 }
 
@@ -150,31 +177,25 @@ pub(crate) struct ActiveSession {
     pub buffers: Option<InferenceBuffers>,
     pub session: Session,
     pub backend_index: usize,
-}
-
-/// Inspect graph I/O without running it, before selecting CUDA-graph/prepared storage.
-pub(crate) fn inspect_graph_io(path: &Path, options: &OnnxOptions) -> Result<ModelInfo> {
-    let probe = builder(options, false)?
-        .with_optimization_level(GraphOptimizationLevel::Disable)
-        .map_err(ort_error)?
-        .with_execution_providers([CPU::default().build().error_on_failure()])
-        .map_err(ort_error)?
-        .commit_from_file(path)?;
-    metadata(&probe)
+    pub info: ModelInfo,
 }
 
 fn configured_builder(
     options: &OnnxOptions,
     index: usize,
-    compiled: bool,
+    is_ep_context: bool,
     static_io: bool,
     build_directory: Option<&Path>,
 ) -> Result<SessionBuilder> {
     let candidates = options.backend.candidates();
     let backend = &candidates[index];
-    let strict = compiled || matches!(options.backend, BackendSelection::Require(_));
+    let strict = is_ep_context || matches!(options.backend, BackendSelection::Require(_));
+    // ORT CUDA graphs require sequential execution.
+    let static_io = static_io && !options.parallel_execution;
     let mut session_builder = builder(options, true)?;
-    if strict && !matches!(backend, Backend::Cpu) {
+    let cpu_target = matches!(backend, Backend::Cpu)
+        || matches!(backend, Backend::Custom { provider, .. } if provider.downcast_ref::<CPU>().is_some());
+    if strict && !cpu_target {
         session_builder = session_builder
             .with_disable_cpu_fallback()
             .map_err(ort_error)?;
@@ -221,6 +242,15 @@ fn configured_builder(
                 .error_on_failure()])
                 .map_err(ort_error)?;
         }
+        #[cfg(target_os = "macos")]
+        Backend::CoreMl => {
+            session_builder = session_builder
+                .with_execution_providers([CoreML::default()
+                    .with_model_format(CoreMlModelFormat::MLProgram)
+                    .build()
+                    .error_on_failure()])
+                .map_err(ort_error)?;
+        }
         Backend::Cpu => {
             session_builder = session_builder
                 .with_execution_providers([CPU::default().build().error_on_failure()])
@@ -237,7 +267,8 @@ fn configured_builder(
 
 /// Use ORT's provider-independent compiler; EPs determine which native state they export.
 pub(crate) fn compile(source: &Path, options: &OnnxOptions) -> Result<Vec<u8>> {
-    let builder = configured_builder(options, 0, false, false, None)?;
+    let builder = configured_builder(options, 0, false, false, None)
+        .map_err(|error| diagnostics::provider_error(&options.backend.candidates()[0], error))?;
     let compiled = ort::compiler::ModelCompiler::new(builder)?
         .with_model_from_file(source)?
         .with_embed_ep_context()?
@@ -249,21 +280,31 @@ pub(crate) fn load(
     path: &Path,
     options: &OnnxOptions,
     index: usize,
-    compiled: bool,
-    static_io: bool,
+    is_ep_context: bool,
+    declared: &ModelInfo,
     build_directory: Option<&Path>,
 ) -> Result<ActiveSession> {
     let backend = &options.backend.candidates()[index];
-    let mut session_builder =
-        configured_builder(options, index, compiled, static_io, build_directory)?;
-    let session = session_builder.commit_from_file(path)?;
-    let info = metadata(&session)?;
+    let mut session_builder = configured_builder(
+        options,
+        index,
+        is_ep_context,
+        buffers::eligible(declared),
+        build_directory,
+    )
+    .map_err(|error| diagnostics::provider_error(backend, error))?;
+    let session = session_builder
+        .commit_from_file(path)
+        .map_err(|error| diagnostics::provider_error(backend, error.into()))?;
+    let info = metadata(&session, declared)?;
     let device_id = match backend {
         Backend::TensorRt => options
             .tensorrt
             .as_ref()
             .map_or(0, |settings| settings.device_id),
         Backend::Cuda => options.cuda.unwrap_or_default().device_id,
+        #[cfg(target_os = "macos")]
+        Backend::CoreMl => 0,
         Backend::Cpu | Backend::Custom { .. } => 0,
     };
     let buffers = if buffers::eligible(&info) && !matches!(backend, Backend::Custom { .. }) {
@@ -272,6 +313,7 @@ pub(crate) fn load(
             &info,
             matches!(backend, Backend::TensorRt | Backend::Cuda),
             device_id,
+            !is_ep_context && matches!(options.backend, BackendSelection::Auto(_)),
         )?)
     } else {
         None
@@ -280,6 +322,7 @@ pub(crate) fn load(
         session,
         buffers,
         backend_index: index,
+        info,
     })
 }
 

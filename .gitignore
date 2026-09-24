@@ -1,0 +1,19 @@
+/target/
+/engine-cache/
+/saved-yolo-engine/
+/.safe-inference-cache/
+/.native-onnx-cache/
+/samples/
+/rendered/
+
+# Local experiments and assets; the repository publishes only the engine.
+/examples/
+/sam3/
+/model/
+/models/
+/docs/
+/scripts/
+/.ruff_cache/
+/.agents/
+/.codex/
+/:memory:.ses

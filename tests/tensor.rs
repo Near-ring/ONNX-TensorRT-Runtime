@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use safe_inference::{DType, Result, TensorSpec, TensorView, element_count};
+use native_onnx::{DType, Result, TensorSpec, TensorView, element_count};
 
 #[test]
 fn checked_dimensions_and_scalar() -> Result<()> {
@@ -9,7 +9,7 @@ fn checked_dimensions_and_scalar() -> Result<()> {
     let spec = TensorSpec {
         name: "x".into(),
         dtype: DType::F32,
-        shape: vec![None, Some(2)],
+        shape: Some(vec![None, Some(2)]),
     };
     assert!(
         spec.validate(&TensorView::f32("x", &[3, 2], &[0.0; 6]))

@@ -1,11 +1,11 @@
 #![forbid(unsafe_code)]
+use native_onnx::{
+    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorData,
+    TensorDataMut, TensorView, f16,
+};
 use onnx_rs::ast::{
     DataType, Dimension, Graph, Model, Node, OpType, OperatorSetId, TensorShape,
     TensorShapeDimension, TensorTypeProto, TypeProto, TypeValue, ValueInfo,
-};
-use safe_inference::{
-    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorData,
-    TensorDataMut, TensorView, f16,
 };
 use std::path::PathBuf;
 
@@ -64,7 +64,7 @@ fn mixed_model() -> Result<PathBuf> {
         ..Default::default()
     };
     let path = std::env::temp_dir().join(format!(
-        "safe-inference-mixed-{}-{:?}.onnx",
+        "native-onnx-mixed-{}-{:?}.onnx",
         std::process::id(),
         std::thread::current().id()
     ));

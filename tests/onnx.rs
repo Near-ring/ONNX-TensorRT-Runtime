@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-use safe_inference::{
+use native_onnx::{
     Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorData,
     TensorDataMut, TensorRtOptions, TensorView, TensorViewMut, ep,
 };
@@ -22,10 +22,31 @@ fn defaults_use_level_three_and_opt_in_fp16() {
     let BackendSelection::Auto(backends) = config.backend else {
         panic!("Expected auto fallback")
     };
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        backends.iter().map(Backend::name).collect::<Vec<_>>(),
+        ["CoreML", "CPU"]
+    );
+    #[cfg(cuda_platform)]
     assert_eq!(
         backends.iter().map(Backend::name).collect::<Vec<_>>(),
         ["TensorRT", "CUDA", "CPU"]
     );
+    #[cfg(not(any(target_os = "macos", cuda_platform)))]
+    assert_eq!(
+        backends.iter().map(Backend::name).collect::<Vec<_>>(),
+        ["CPU"]
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn macos_default_runs_with_coreml_or_cpu_fallback() -> Result<()> {
+    let mut model = OnnxRuntime::load(fixture("linear.onnx"), OnnxOptions::default())?;
+    assert!(matches!(model.backend(), Some("CoreML" | "CPU")));
+    let input = TensorView::f32("x", &[1, 16], &[1.; 16]);
+    assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
+    Ok(())
 }
 
 #[test]
@@ -111,7 +132,7 @@ fn unavailable_configured_provider_falls_back_with_reason() -> Result<()> {
             Backend::Custom {
                 name: "unavailable-v1".into(),
                 provider: ep::CUDA::default()
-                    .with_arbitrary_config("safe_inference_invalid_test_option", "1")
+                    .with_arbitrary_config("native_onnx_invalid_test_option", "1")
                     .build(),
             },
             Backend::Cpu,
@@ -141,7 +162,7 @@ fn required_unavailable_provider_returns_error() {
         backend: BackendSelection::Require(Backend::Custom {
             name: "unavailable".into(),
             provider: ep::CUDA::default()
-                .with_arbitrary_config("safe_inference_invalid_test_option", "1")
+                .with_arbitrary_config("native_onnx_invalid_test_option", "1")
                 .build(),
         }),
         ..OnnxOptions::default()
@@ -151,10 +172,8 @@ fn required_unavailable_provider_returns_error() {
 
 #[test]
 fn ordinary_onnx_detection_does_not_depend_on_extension() -> Result<()> {
-    let path = std::env::temp_dir().join(format!(
-        "safe-inference-graph-{}.ctx.onnx",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("native-onnx-graph-{}.ctx.onnx", std::process::id()));
     std::fs::copy(fixture("multi.onnx"), &path)?;
     let model = OnnxRuntime::load(&path, OnnxOptions::cpu())?;
     assert_eq!(model.backend(), Some("CPU"));
@@ -203,6 +222,7 @@ fn invalid_provider_options_obey_backend_selection() -> Result<()> {
         assert!(OnnxRuntime::load(fixture("linear.onnx"), options).is_err());
     }
     let options = OnnxOptions {
+        backend: BackendSelection::Auto(vec![Backend::TensorRt, Backend::Cuda, Backend::Cpu]),
         tensorrt: Some(invalid_trt),
         cuda: Some(invalid_cuda),
         ..OnnxOptions::default()

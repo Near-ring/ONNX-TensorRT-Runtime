@@ -19,9 +19,11 @@ pub(crate) struct InferenceBuffers {
     pub inputs: Vec<TensorSlot>,
     pub outputs: Vec<TensorSlot>,
     binding: IoBinding,
-    gpu: bool,
+    cuda: bool,
     device_id: i32,
-    pub valid_output: bool,
+    rebind_inputs: bool,
+    inputs_bound: bool,
+    pub outputs_valid: bool,
     // ORT allocated tensors do not retain the Allocator wrapper. Keep both alive
     // until after all tensors and I/O bindings have been dropped (field order).
     _host_allocator: Allocator,
@@ -31,11 +33,11 @@ pub(crate) struct InferenceBuffers {
 pub(crate) fn eligible(info: &ModelInfo) -> bool {
     !info.inputs.is_empty()
         && !info.outputs.is_empty()
-        && info
-            .inputs
-            .iter()
-            .chain(&info.outputs)
-            .all(|s| s.shape.iter().all(|d| d.is_some_and(|n| n > 0)))
+        && info.inputs.iter().chain(&info.outputs).all(|s| {
+            s.shape
+                .as_ref()
+                .is_some_and(|shape| shape.iter().all(|d| d.is_some_and(|n| n > 0)))
+        })
 }
 
 fn ort_dtype(dtype: DType) -> TensorElementType {
@@ -110,12 +112,18 @@ impl TensorSlot {
 }
 
 impl InferenceBuffers {
-    pub fn new(session: &Session, info: &ModelInfo, gpu: bool, device_id: i32) -> Result<Self> {
+    pub fn new(
+        session: &Session,
+        info: &ModelInfo,
+        cuda: bool,
+        device_id: i32,
+        rebind_inputs: bool,
+    ) -> Result<Self> {
         ensure!(
             eligible(info),
             "Prepared buffers require fixed, positive tensor shapes"
         );
-        let host = if gpu {
+        let host = if cuda {
             Allocator::new(
                 session,
                 MemoryInfo::new(
@@ -128,7 +136,7 @@ impl InferenceBuffers {
         } else {
             Allocator::default()
         };
-        let device = if gpu {
+        let device = if cuda {
             Some(Allocator::new(
                 session,
                 MemoryInfo::new(
@@ -146,12 +154,14 @@ impl InferenceBuffers {
         let mut outputs = Vec::new();
         for spec in &info.inputs {
             let shape = spec.fixed_shape().expect("validated fixed shape");
+            // ort rc.13 zeroes CPU-accessible allocations in DynTensor::new.
             let tensor = DynTensor::new(&host, ort_dtype(spec.dtype), shape.as_slice())?;
             let device = device
                 .as_ref()
                 .map(|a| DynTensor::new(a, ort_dtype(spec.dtype), shape.as_slice()))
                 .transpose()?;
-            binding.bind_input(&spec.name, device.as_ref().unwrap_or(&tensor))?;
+            // Bind only after uploading initialized data in run(). Binding may
+            // copy immediately when ORT places this input on another provider.
             inputs.push(TensorSlot {
                 name: spec.name.clone(),
                 shape,
@@ -190,26 +200,39 @@ impl InferenceBuffers {
             inputs,
             outputs,
             binding,
-            gpu,
+            cuda,
             device_id,
-            valid_output: false,
+            rebind_inputs,
+            inputs_bound: false,
+            outputs_valid: false,
             _host_allocator: host,
             _device_allocator: device,
         })
     }
     pub fn run(&mut self, session: &mut Session) -> Result<()> {
-        self.valid_output = false;
-        if self.gpu {
+        self.outputs_valid = false;
+        if self.cuda {
             cuda_transfer::upload(
                 self.inputs
                     .iter_mut()
-                    .map(|input| (&input.host, input.device.as_mut().expect("GPU input"))),
+                    .map(|input| (&input.host, input.device.as_mut().expect("CUDA input"))),
                 self.device_id,
             )
             .context("Pinned H2D transfers")?;
         }
+        // ORT caches cross-device copies at bind time. Auto mode must rebind after
+        // updates so CPU partitions see fresh inputs. Strict GPU sessions keep
+        // their original device addresses for CUDA graph replay.
+        if !self.inputs_bound || self.rebind_inputs {
+            for input in &self.inputs {
+                self.binding
+                    .bind_input(&input.name, input.device.as_ref().unwrap_or(&input.host))?;
+            }
+            self.binding.synchronize_inputs()?;
+            self.inputs_bound = true;
+        }
         let values = session.run_binding(&self.binding).context("Inference")?;
-        if self.gpu {
+        if self.cuda {
             let device_outputs = self
                 .outputs
                 .iter()
@@ -224,7 +247,7 @@ impl InferenceBuffers {
             )
             .context("Pinned D2H transfers")?;
         }
-        self.valid_output = true;
+        self.outputs_valid = true;
         Ok(())
     }
 }

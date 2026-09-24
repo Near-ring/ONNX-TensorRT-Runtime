@@ -51,7 +51,11 @@ impl Driver {
         // SAFETY: Load only the system CUDA driver and its documented C ABI symbols.
         // The Library is kept alive with the function pointers for the process lifetime.
         unsafe {
-            let library = Library::new(name).with_context(|| format!("Load CUDA driver {name}"))?;
+            let library = Library::new(name).with_context(|| format!(
+                "Cannot load CUDA driver {name}. Install the NVIDIA driver required by your CUDA runtime \
+                 (R580 or newer for CUDA 13.x), expose the GPU to this process, and restart it. \
+                 Alternatively use OnnxOptions::cpu()."
+            ))?;
             Ok(Self {
                 pointer_attribute: *library.get(b"cuPointerGetAttribute\0")?,
                 push: *library.get(b"cuCtxPushCurrent_v2\0")?,

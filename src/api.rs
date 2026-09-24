@@ -2,9 +2,10 @@
 use crate::engine::ModelFormat;
 use crate::session::ActiveSession;
 use crate::{
-    Backend, BackendSelection, OnnxOptions, Result, Tensor, TensorSpec, TensorView, TensorViewMut,
+    Backend, BackendSelection, CompileOptions, OnnxOptions, Result, Tensor, TensorSpec, TensorView,
+    TensorViewMut,
 };
-use crate::{buffers, engine, session};
+use crate::{engine, session};
 use anyhow::{Context, bail, ensure};
 use std::{
     fs,
@@ -16,14 +17,27 @@ use std::{
 /// ONNX input and output names, data types, and shapes.
 #[derive(Clone, Debug)]
 pub struct ModelInfo {
+    /// Required inputs, in model order.
     pub inputs: Vec<TensorSpec>,
+    /// Produced outputs, in model order.
     pub outputs: Vec<TensorSpec>,
 }
 
+/// A provider failure recorded before trying the next configured backend.
 #[derive(Clone, Debug)]
 pub struct FallbackEvent {
+    /// Name of the provider that failed.
     pub backend: String,
+    /// Error message including its context chain.
     pub error: String,
+}
+
+fn failure_report(events: &[FallbackEvent]) -> String {
+    events
+        .iter()
+        .map(|event| format!("  {}: {}", event.backend, event.error))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Format produced by a successful compilation.
@@ -35,12 +49,13 @@ pub enum CompiledFormat {
     EpContext,
 }
 
-/// Actual compilation result, including any candidates skipped in Auto mode.
+/// Artifact compiled and validated for the explicitly requested target.
 #[derive(Clone, Debug)]
 pub struct Compilation {
+    /// Provider that successfully compiled and validated the artifact.
     pub backend: String,
+    /// Representation stored at the requested destination.
     pub format: CompiledFormat,
-    pub fallback_events: Vec<FallbackEvent>,
 }
 
 /// An ONNX model session with ordered provider fallback and reusable inference buffers.
@@ -51,7 +66,7 @@ pub struct OnnxRuntime {
     info: ModelInfo,
     active: Option<ActiveSession>,
     fallback_events: Vec<FallbackEvent>,
-    compiled: bool,
+    is_ep_context: bool,
     _no_send_sync: PhantomData<Rc<()>>,
 }
 
@@ -62,56 +77,55 @@ impl OnnxRuntime {
         Self::load_internal(path.as_ref(), options, None)
     }
 
-    /// Compile for the selected backend and validate the saved model with representative inputs.
-    /// Require fails on that provider's error; Auto tries each candidate in order.
+    /// Compile for an explicit target and validate the saved model with representative inputs.
+    /// [`CompileOptions`] requires a target with its provider configuration. Any target
+    /// failure is returned directly; compilation never falls back to another provider.
     /// The result reports an optimized ONNX graph or an embedded provider context.
     /// Existing output files are never overwritten; correspondence checks are the caller's job.
+    ///
+    /// Inference options with automatic backend selection cannot be used to compile:
+    /// ```compile_fail
+    /// use native_onnx::{OnnxOptions, OnnxRuntime};
+    /// OnnxRuntime::compile("model.onnx", "compiled.onnx", OnnxOptions::default(), &[]);
+    /// ```
     pub fn compile(
         source: impl AsRef<Path>,
         destination: impl AsRef<Path>,
-        options: OnnxOptions,
+        options: CompileOptions,
         inputs: &[TensorView<'_>],
     ) -> Result<Compilation> {
         let destination = destination.as_ref();
         ensure!(!destination.exists(), "Compiled output already exists");
+        let options = options.into_runtime_options()?;
         options.validate()?;
         session::initialize(&options)?;
         let source = source.as_ref().canonicalize().context("ONNX source path")?;
         ensure!(
-            matches!(engine::inspect(&source)?, ModelFormat::Onnx),
+            matches!(engine::inspect(&source, &options)?.0, ModelFormat::Onnx),
             "Compile requires an ONNX graph, not an existing EPContext"
         );
-        let mut fallback_events = Vec::new();
-        for backend in options.backend.candidates() {
-            let mut selected = options.clone();
-            selected.backend = BackendSelection::Require(backend.clone());
-            match Self::compile_candidate(&source, selected, inputs) {
-                Ok((bytes, format)) => {
-                    use std::io::Write;
-                    let mut file = fs::OpenOptions::new()
-                        .write(true)
-                        .create_new(true)
-                        .open(destination)?;
-                    file.write_all(&bytes)?;
-                    file.sync_all()?;
-                    return Ok(Compilation {
-                        backend: backend.name().into(),
-                        format,
-                        fallback_events,
-                    });
-                }
-                Err(error) => {
-                    if matches!(options.backend, BackendSelection::Require(_)) {
-                        return Err(error.context(format!("Compile for {}", backend.name())));
-                    }
-                    fallback_events.push(FallbackEvent {
-                        backend: backend.name().into(),
-                        error: format!("{error:#}"),
-                    });
-                }
-            }
-        }
-        bail!("All configured compilation backends failed: {fallback_events:?}")
+        let backend = options.backend.candidates()[0].name().to_owned();
+        let (bytes, format) = Self::compile_and_validate(&source, options, inputs)
+            .with_context(|| format!("Compile for {backend}"))?;
+        use std::io::Write;
+        let parent = destination
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut file = tempfile::Builder::new()
+            .prefix(".native-onnx-")
+            .tempfile_in(parent)?;
+        file.write_all(&bytes)?;
+        file.as_file().sync_all()?;
+        file.persist_noclobber(destination).map_err(|error| {
+            // Dropping PersistError's temporary file removes incomplete output.
+            anyhow::anyhow!(
+                "Publish compiled model {}: {}",
+                destination.display(),
+                error.error
+            )
+        })?;
+        Ok(Compilation { backend, format })
     }
 
     /// Primary registered provider, not a claim that every node runs on that provider.
@@ -120,12 +134,16 @@ impl OnnxRuntime {
             .as_ref()
             .map(|a| self.options.backend.candidates()[a.backend_index].name())
     }
+    /// Whole-session provider failures recorded during loading or inference.
     pub fn fallback_events(&self) -> &[FallbackEvent] {
         &self.fallback_events
     }
+    /// Whether the active session has reusable buffers for fixed-shape tensor I/O.
     pub fn is_prepared(&self) -> bool {
         self.active.as_ref().is_some_and(|a| a.buffers.is_some())
     }
+    /// Finish ONNX Runtime profiling and return the profile's file path.
+    /// Enable profiling with [`OnnxOptions::profiling`] before loading the model.
     pub fn end_profiling(&mut self) -> Result<String> {
         Ok(self
             .active
@@ -217,13 +235,14 @@ impl OnnxRuntime {
 
 impl OnnxRuntime {
     /// Borrow a persistent input buffer for fixed-shape tensor I/O.
+    /// Inputs are initialized to zero when the session is loaded.
     pub fn input_mut(&mut self, name: &str) -> Result<TensorViewMut<'_>> {
         let buffers = self
             .active
             .as_mut()
             .and_then(|a| a.buffers.as_mut())
             .context("Prepared buffers unavailable; use inference for dynamic I/O")?;
-        buffers.valid_output = false;
+        buffers.outputs_valid = false;
         buffers
             .inputs
             .iter_mut()
@@ -239,7 +258,7 @@ impl OnnxRuntime {
             .and_then(|a| a.buffers.as_ref())
             .context("Prepared buffers unavailable")?;
         ensure!(
-            buffers.valid_output,
+            buffers.outputs_valid,
             "No successful output for current input"
         );
         buffers
@@ -279,7 +298,7 @@ impl OnnxRuntime {
 }
 
 impl OnnxRuntime {
-    fn compile_candidate(
+    fn compile_and_validate(
         source: &Path,
         mut options: OnnxOptions,
         inputs: &[TensorView<'_>],
@@ -299,9 +318,9 @@ impl OnnxRuntime {
         };
         let staged = directory.path().join("compiled.onnx");
         fs::write(&staged, &bytes)?;
-        let format = match engine::inspect(&staged)? {
+        let format = match engine::inspect(&staged, &options)?.0 {
             ModelFormat::Onnx => CompiledFormat::OptimizedOnnx,
-            ModelFormat::EpContext { .. } => CompiledFormat::EpContext,
+            ModelFormat::EpContext => CompiledFormat::EpContext,
         };
         // Reopen and execute the actual exported bytes before publishing the destination.
         options.profiling = None;
@@ -318,27 +337,24 @@ impl OnnxRuntime {
         options.validate()?;
         session::initialize(&options)?;
         let path = path.canonicalize().context("Model path")?;
-        let format = engine::inspect(&path)?;
+        let (format, info) = engine::inspect(&path, &options)?;
         let mut model = Self {
             path,
             options,
-            info: ModelInfo {
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-            },
+            info,
             active: None,
             fallback_events: Vec::new(),
-            compiled: matches!(format, ModelFormat::EpContext { .. }),
+            is_ep_context: matches!(format, ModelFormat::EpContext),
             _no_send_sync: PhantomData,
         };
-        if let ModelFormat::EpContext { static_io } = format {
+        if let ModelFormat::EpContext = format {
             ensure!(
                 build_directory.is_none(),
                 "Compile requires the original ONNX graph"
             );
             let mut failures = Vec::new();
             for index in 0..model.options.backend.candidates().len() {
-                match session::load(&model.path, &model.options, index, true, static_io, None) {
+                match session::load(&model.path, &model.options, index, true, &model.info, None) {
                     Ok(active) => {
                         model.active = Some(active);
                         break;
@@ -351,15 +367,19 @@ impl OnnxRuntime {
             }
             ensure!(
                 model.active.is_some(),
-                "No configured backend could load the EPContext: {failures:?}"
+                "No configured backend could load the EPContext:\n{}",
+                failure_report(&failures)
             );
             model.fallback_events = failures;
         } else {
-            model.info = session::inspect_graph_io(&model.path, &model.options)?;
             model.activate(0, build_directory)?;
         }
-        model.info =
-            session::metadata(&model.active.as_ref().context("No active backend")?.session)?;
+        model.info = model
+            .active
+            .as_ref()
+            .context("No active backend")?
+            .info
+            .clone();
         Ok(model)
     }
 
@@ -371,10 +391,11 @@ impl OnnxRuntime {
                 &self.options,
                 index,
                 false,
-                buffers::eligible(&self.info),
+                &self.info,
                 build_directory,
             ) {
                 Ok(active) => {
+                    self.info = active.info.clone();
                     self.active = Some(active);
                     return Ok(());
                 }
@@ -385,8 +406,8 @@ impl OnnxRuntime {
             }
         }
         bail!(
-            "All configured ONNX backends failed: {:?}",
-            self.fallback_events
+            "All configured ONNX backends failed:\n{}",
+            failure_report(&self.fallback_events)
         )
     }
 
@@ -417,7 +438,7 @@ impl OnnxRuntime {
             .as_ref()
             .context("No active backend")?
             .backend_index;
-        if self.compiled || matches!(self.options.backend, BackendSelection::Require(_)) {
+        if self.is_ep_context || matches!(self.options.backend, BackendSelection::Require(_)) {
             return Err(error);
         }
         self.fallback_events.push(FallbackEvent {
