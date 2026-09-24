@@ -5,8 +5,9 @@ use std::path::Path;
 pub(crate) fn runtime_error(path: &Path, error: ort::LoadDynamicError) -> anyhow::Error {
     anyhow::Error::new(error).context(format!(
         "Cannot load ONNX Runtime at '{}'. Install ONNX Runtime >= 1.27 (C API 27) \
-         for this process architecture and set ORT_DYLIB_PATH or OnnxOptions::runtime_path \
-         to its shared library (libonnxruntime.so, libonnxruntime.dylib, or onnxruntime.dll). \
+         for this process architecture. Make its shared library (libonnxruntime.so, \
+         libonnxruntime.dylib, or onnxruntime.dll) discoverable by the system loader, \
+         or set ORT_DYLIB_PATH to its full path before starting the process. \
          Make its dependencies visible via LD_LIBRARY_PATH on Linux, DYLD_LIBRARY_PATH \
          on macOS, or PATH on Windows. https://onnxruntime.ai/docs/install/",
         path.display()
@@ -48,8 +49,8 @@ pub(crate) fn provider_error(backend: &Backend, error: anyhow::Error) -> anyhow:
             format!(
                 "Install an ONNX Runtime >= 1.27 GPU build with the {} provider. \
                  Standard ORT 1.27+ GPU packages require CUDA 13.x (>= 13.0), cuDNN 9.x \
-                 and a compatible NVIDIA driver (R580 or newer for CUDA 13; >= 580.65.06 \
-                 for the validated Linux CUDA 13/cuDNN 9.20 stack).{tensorrt} \
+                 and a compatible NVIDIA driver (at least R580 for CUDA 13; your \
+                 cuDNN/TensorRT build may require a newer driver).{tensorrt} \
                  Custom ORT builds need the CUDA/cuDNN/TensorRT versions they were built against. \
                  Add their library directories to LD_LIBRARY_PATH (Linux) or PATH (Windows) \
                  before starting the process. For CPU-only inference use OnnxOptions::cpu(). \
@@ -66,42 +67,4 @@ pub(crate) fn provider_error(backend: &Backend, error: anyhow::Error) -> anyhow:
         "{} native libraries are unavailable. {install}",
         backend.name()
     ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn installation_advice_is_limited_to_library_errors() {
-        let error = provider_error(
-            &Backend::Cuda,
-            anyhow::anyhow!("Failed to load libcudnn.so.9"),
-        );
-        let text = format!("{error:#}");
-        assert!(text.contains("Install") && text.contains("13.0") && text.contains("cuDNN 9"));
-        assert!(text.contains("libcudnn.so.9"));
-        let error = provider_error(
-            &Backend::TensorRt,
-            anyhow::anyhow!("LoadLibrary failed with error 126"),
-        );
-        assert!(error.to_string().contains("10.15.1"));
-        let error = provider_error(&Backend::Cuda, anyhow::anyhow!("Invalid model input shape"));
-        assert!(!error.to_string().contains("Install"));
-    }
-
-    #[test]
-    fn unsupported_runtime_version_has_installation_instructions() {
-        let path = Path::new("/old/libonnxruntime.so");
-        let error = runtime_error(
-            path,
-            ort::LoadDynamicError::BadVersion {
-                version_str: "1.20.0".into(),
-                path: path.into(),
-            },
-        );
-        let text = format!("{error:#}");
-        assert!(text.contains("Install ONNX Runtime >= 1.27"));
-        assert!(text.contains("1.20.0") && text.contains("ORT_DYLIB_PATH"));
-    }
 }

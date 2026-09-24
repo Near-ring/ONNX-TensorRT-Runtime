@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use native_onnx::{
-    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorView,
+    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxSession, Result, TensorView,
     TensorViewMut,
 };
 use ort::{environment::Environment, logging::LogLevel};
@@ -41,7 +41,7 @@ fn gpu_copy_cache_stays_bounded_across_runs_and_session_drops() -> Result<()> {
             }),
             ..OnnxOptions::default()
         };
-        let mut model = OnnxRuntime::load(fixture("linear.onnx"), options)?;
+        let mut model = OnnxSession::load(fixture("linear.onnx"), options)?;
         assert!(model.is_prepared());
         let output_name = model.info().outputs[0].name.clone();
         let after_load = arena_count.load(Ordering::Relaxed);

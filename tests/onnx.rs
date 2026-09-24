@@ -1,13 +1,13 @@
 #![forbid(unsafe_code)]
 use native_onnx::{
-    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorData,
+    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxSession, Result, TensorData,
     TensorDataMut, TensorRtOptions, TensorView, TensorViewMut, ep,
 };
 mod common;
 use common::fixture;
 
 // CUDA graph sessions cannot safely move between or be shared by threads.
-static_assertions::assert_not_impl_any!(OnnxRuntime: Send, Sync);
+static_assertions::assert_not_impl_any!(OnnxSession: Send, Sync);
 
 #[test]
 fn defaults_use_level_three_and_opt_in_fp16() {
@@ -17,7 +17,7 @@ fn defaults_use_level_three_and_opt_in_fp16() {
     assert_eq!(tensorrt.builder_optimization_level, 3);
     assert!(!tensorrt.fp16 && tensorrt.tf32 && tensorrt.cuda_graph && tensorrt.sparsity);
     let cuda = CudaOptions::default();
-    assert!(cuda.tf32 && !cuda.cuda_graph);
+    assert!(cuda.tf32 && cuda.cuda_graph);
     assert_eq!(tensorrt.workspace_bytes, 4 * 1024 * 1024 * 1024);
     let BackendSelection::Auto(backends) = config.backend else {
         panic!("Expected auto fallback")
@@ -42,7 +42,7 @@ fn defaults_use_level_three_and_opt_in_fp16() {
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_default_runs_with_coreml_or_cpu_fallback() -> Result<()> {
-    let mut model = OnnxRuntime::load(fixture("linear.onnx"), OnnxOptions::default())?;
+    let mut model = OnnxSession::load(fixture("linear.onnx"), OnnxOptions::default())?;
     assert!(matches!(model.backend(), Some("CoreML" | "CPU")));
     let input = TensorView::f32("x", &[1, 16], &[1.; 16]);
     assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
@@ -51,7 +51,7 @@ fn macos_default_runs_with_coreml_or_cpu_fallback() -> Result<()> {
 
 #[test]
 fn cpu_multi_input_buffers_and_validation() -> Result<()> {
-    let mut model = OnnxRuntime::load(fixture("multi.onnx"), OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(fixture("multi.onnx"), OnnxOptions::cpu())?;
     assert_eq!(model.backend(), Some("CPU"));
     assert!(model.is_prepared());
     assert!(model.output("sum").is_err());
@@ -101,7 +101,7 @@ fn cpu_multi_input_buffers_and_validation() -> Result<()> {
 
 #[test]
 fn dynamic_int64_and_reused_output() -> Result<()> {
-    let mut model = OnnxRuntime::load(fixture("dynamic.onnx"), OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(fixture("dynamic.onnx"), OnnxOptions::cpu())?;
     assert!(!model.is_prepared());
     for batch in [1, 4, 2] {
         let shape = [batch, 3];
@@ -139,7 +139,7 @@ fn unavailable_configured_provider_falls_back_with_reason() -> Result<()> {
         ]),
         ..OnnxOptions::default()
     };
-    let model = OnnxRuntime::load(fixture("multi.onnx"), options)?;
+    let model = OnnxSession::load(fixture("multi.onnx"), options)?;
     assert_eq!(model.backend(), Some("CPU"));
     assert_eq!(model.fallback_events().len(), 1);
     assert!(!model.fallback_events()[0].error.is_empty());
@@ -152,7 +152,7 @@ fn no_configured_backend_is_an_error() {
         backend: BackendSelection::Auto(vec![]),
         ..OnnxOptions::default()
     };
-    assert!(OnnxRuntime::load(fixture("multi.onnx"), options).is_err());
+    assert!(OnnxSession::load(fixture("multi.onnx"), options).is_err());
 }
 
 #[test]
@@ -167,7 +167,7 @@ fn required_unavailable_provider_returns_error() {
         }),
         ..OnnxOptions::default()
     };
-    assert!(OnnxRuntime::load(fixture("multi.onnx"), options).is_err());
+    assert!(OnnxSession::load(fixture("multi.onnx"), options).is_err());
 }
 
 #[test]
@@ -175,7 +175,7 @@ fn ordinary_onnx_detection_does_not_depend_on_extension() -> Result<()> {
     let path =
         std::env::temp_dir().join(format!("native-onnx-graph-{}.ctx.onnx", std::process::id()));
     std::fs::copy(fixture("multi.onnx"), &path)?;
-    let model = OnnxRuntime::load(&path, OnnxOptions::cpu())?;
+    let model = OnnxSession::load(&path, OnnxOptions::cpu())?;
     assert_eq!(model.backend(), Some("CPU"));
     drop(model);
     std::fs::remove_file(path)?;
@@ -196,7 +196,7 @@ fn cpu_ignores_unrelated_gpu_settings() -> Result<()> {
         }),
         ..OnnxOptions::cpu()
     };
-    let mut model = OnnxRuntime::load(fixture("linear.onnx"), options)?;
+    let mut model = OnnxSession::load(fixture("linear.onnx"), options)?;
     let input = TensorView::f32("x", &[1, 16], &[1.; 16]);
     assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
     Ok(())
@@ -219,7 +219,7 @@ fn invalid_provider_options_obey_backend_selection() -> Result<()> {
             cuda: Some(invalid_cuda),
             ..OnnxOptions::default()
         };
-        assert!(OnnxRuntime::load(fixture("linear.onnx"), options).is_err());
+        assert!(OnnxSession::load(fixture("linear.onnx"), options).is_err());
     }
     let options = OnnxOptions {
         backend: BackendSelection::Auto(vec![Backend::TensorRt, Backend::Cuda, Backend::Cpu]),
@@ -227,7 +227,7 @@ fn invalid_provider_options_obey_backend_selection() -> Result<()> {
         cuda: Some(invalid_cuda),
         ..OnnxOptions::default()
     };
-    let model = OnnxRuntime::load(fixture("linear.onnx"), options)?;
+    let model = OnnxSession::load(fixture("linear.onnx"), options)?;
     assert_eq!(model.backend(), Some("CPU"));
     assert_eq!(model.fallback_events().len(), 2);
     Ok(())

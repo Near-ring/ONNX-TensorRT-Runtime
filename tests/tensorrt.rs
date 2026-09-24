@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use native_onnx::{
     Backend, BackendSelection, CompileOptions, CompileTarget, CompiledFormat, CudaOptions,
-    OnnxOptions, OnnxRuntime, Result, TensorRtOptions, TensorView,
+    OnnxOptions, OnnxSession, Result, TensorRtOptions, TensorView,
 };
 mod common;
 use common::fixture;
@@ -15,25 +15,49 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     let source = root.join("source.onnx");
     let engine = root.join("compiled.ctx.onnx");
     std::fs::copy(fixture("linear.onnx"), &source)?;
-    let options = OnnxOptions::default();
+    let options = OnnxOptions {
+        tensorrt: Some(TensorRtOptions {
+            cuda_graph: true,
+            ..TensorRtOptions::default()
+        }),
+        ..OnnxOptions::default()
+    };
     let compile = CompileOptions::new(CompileTarget::TensorRt(TensorRtOptions {
         builder_optimization_level: 2,
         fp16: true,
+        cuda_graph: true,
         ..TensorRtOptions::default()
     }));
     let x = [1.; 16];
     let input = TensorView::f32("x", &[1, 16], &x);
-    let compiled = OnnxRuntime::compile(&source, &engine, compile.clone(), &[input])?;
+    let compiled = OnnxSession::compile(&source, &engine, compile.clone(), &[input])?;
     assert_eq!(compiled.backend, "TensorRT");
     assert_eq!(compiled.format, CompiledFormat::EpContext);
-    assert!(OnnxRuntime::compile(&source, &engine, compile.clone(), &[input]).is_err());
+    assert!(OnnxSession::compile(&source, &engine, compile.clone(), &[input]).is_err());
     std::fs::remove_file(&source)?;
     // The only deployment artifact is the embedded engine; no manifest or source is needed.
     assert_eq!(std::fs::read_dir(&root)?.count(), 1);
     let before = std::fs::read(&engine)?;
     let mtime = std::fs::metadata(&engine)?.modified()?;
-    let mut model = OnnxRuntime::load(&engine, options.clone())?;
+    let mut model = OnnxSession::load(&engine, options.clone())?;
     assert_eq!(model.backend(), Some("TensorRT"));
+    // CUDA and TensorRT graph sessions can coexist on the same device.
+    let mut cuda_peer = OnnxSession::load(
+        fixture("linear.onnx"),
+        OnnxOptions {
+            backend: BackendSelection::Require(Backend::Cuda),
+            cuda: Some(CudaOptions {
+                cuda_graph: true,
+                ..CudaOptions::default()
+            }),
+            ..OnnxOptions::default()
+        },
+    )?;
+    assert!(model.cuda_graph_enabled() && cuda_peer.cuda_graph_enabled());
+    assert_eq!(
+        cuda_peer.inference(&[input])?[0].view().as_f32()?,
+        &[16.; 16]
+    );
     assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
     assert_eq!(
         model.inference(&[TensorView::f32("x", &[1, 16], &[0.; 16])])?[0]
@@ -49,7 +73,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
         ..OnnxOptions::default()
     };
     let cuda_model = root.join("cuda.onnx");
-    let compiled = OnnxRuntime::compile(
+    let compiled = OnnxSession::compile(
         fixture("linear.onnx"),
         &cuda_model,
         CompileOptions::new(CompileTarget::Cuda(CudaOptions {
@@ -60,7 +84,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     )?;
     assert_eq!(compiled.backend, "CUDA");
     assert_eq!(compiled.format, CompiledFormat::OptimizedOnnx);
-    let mut cuda = OnnxRuntime::load(&cuda_model, cuda_options)?;
+    let mut cuda = OnnxSession::load(&cuda_model, cuda_options)?;
     assert_eq!(cuda.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
     drop(cuda);
     assert_eq!(before, std::fs::read(&engine)?);
@@ -72,17 +96,17 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
         cuda_graph: false,
         ..TensorRtOptions::default()
     });
-    let mut model = OnnxRuntime::load(&engine, changed)?;
+    let mut model = OnnxSession::load(&engine, changed)?;
     assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
     drop(model);
-    assert!(OnnxRuntime::load(&engine, OnnxOptions::cpu()).is_err());
+    assert!(OnnxSession::load(&engine, OnnxOptions::cpu()).is_err());
     assert!(
-        OnnxRuntime::compile(&engine, root.join("invalid.ctx.onnx"), compile, &[input]).is_err()
+        OnnxSession::compile(&engine, root.join("invalid.ctx.onnx"), compile, &[input]).is_err()
     );
     // Contents decide the format, even if the extension changes.
     let renamed = root.join("compiled.bin");
     std::fs::rename(&engine, &renamed)?;
-    let mut model = OnnxRuntime::load(&renamed, options.clone())?;
+    let mut model = OnnxSession::load(&renamed, options.clone())?;
     assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
     drop(model);
     // Strict GPU selection succeeds when all nodes can run there.
@@ -105,7 +129,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
             });
         }
         strict.backend = BackendSelection::Require(backend);
-        let mut model = OnnxRuntime::load(fixture("linear.onnx"), strict)?;
+        let mut model = OnnxSession::load(fixture("linear.onnx"), strict)?;
         assert_eq!(model.backend(), Some(expected.as_str()));
         assert!(model.fallback_events().is_empty());
         assert_eq!(model.inference(&[input])?[0].view().as_f32()?, &[16.; 16]);
@@ -117,16 +141,16 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
         backend: BackendSelection::Require(Backend::Cuda),
         ..OnnxOptions::default()
     };
-    assert!(OnnxRuntime::load(&cpu_graph, strict).is_err());
+    assert!(OnnxSession::load(&cpu_graph, strict).is_err());
     let auto = OnnxOptions {
         backend: BackendSelection::Auto(vec![Backend::Cuda, Backend::Cpu]),
         ..OnnxOptions::default()
     };
-    let mut model = OnnxRuntime::load(&cpu_graph, auto)?;
+    let mut model = OnnxSession::load(&cpu_graph, auto)?;
     let values = [2., 1., 2., 1.];
     let cpu_input = TensorView::f32("x", &[4], &values);
     let unsupported_output = root.join("unsupported.onnx");
-    let error = OnnxRuntime::compile(
+    let error = OnnxSession::compile(
         &cpu_graph,
         &unsupported_output,
         CompileOptions::new(CompileTarget::Cuda(CudaOptions::default())),
@@ -144,7 +168,7 @@ fn compile_load_inference_and_strict_backend() -> Result<()> {
     drop(model);
     // A broken wrapper returns an error rather than rebuilding or selecting another provider.
     std::fs::write(&renamed, b"invalid model")?;
-    assert!(OnnxRuntime::load(&renamed, options).is_err());
+    assert!(OnnxSession::load(&renamed, options).is_err());
     std::fs::remove_dir_all(root)?;
     Ok(())
 }

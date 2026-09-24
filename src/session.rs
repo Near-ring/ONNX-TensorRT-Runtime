@@ -2,6 +2,7 @@
 use crate::buffers::{self, InferenceBuffers};
 use crate::{Backend, BackendSelection, CudaOptions, OnnxOptions, TensorRtOptions, diagnostics};
 use crate::{DType, ModelInfo, Result, Tensor, TensorBuffer, TensorData, TensorSpec, TensorView};
+use crate::{cuda_graph, cuda_transfer::CudaStream};
 use anyhow::{Context, bail, ensure};
 #[cfg(target_os = "macos")]
 use ort::ep::{CoreML, coreml::ModelFormat as CoreMlModelFormat};
@@ -29,11 +30,10 @@ fn ort_error(error: impl std::fmt::Display) -> anyhow::Error {
     anyhow::anyhow!("{error}")
 }
 
-pub(super) fn initialize(options: &OnnxOptions) -> Result<()> {
-    let path = options
-        .runtime_path
-        .clone()
-        .or_else(|| std::env::var_os("ORT_DYLIB_PATH").map(PathBuf::from))
+pub(super) fn initialize() -> Result<()> {
+    let _guard = cuda_graph::exclusive()?;
+    let path = std::env::var_os("ORT_DYLIB_PATH")
+        .map(PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or_else(|| {
             format!(
@@ -76,7 +76,7 @@ fn builder(options: &OnnxOptions, profiling: bool) -> Result<SessionBuilder> {
     Ok(session_builder)
 }
 
-fn tensorrt_provider(options: &OnnxOptions, static_io_tensor: bool) -> Result<TensorRT> {
+fn tensorrt_provider(options: &OnnxOptions, cuda_graph: bool) -> Result<TensorRT> {
     let defaults = TensorRtOptions::default();
     let settings = options.tensorrt.as_ref().unwrap_or(&defaults);
     settings.validate()?;
@@ -89,7 +89,7 @@ fn tensorrt_provider(options: &OnnxOptions, static_io_tensor: bool) -> Result<Te
         .with_max_workspace_size(settings.workspace_bytes)
         .with_builder_optimization_level(settings.builder_optimization_level)
         .with_auxiliary_streams(settings.auxiliary_streams)
-        .with_cuda_graph(static_io_tensor && settings.cuda_graph);
+        .with_cuda_graph(cuda_graph);
     if let Some(v) = &settings.min_shapes {
         provider = provider.with_profile_min_shapes(v);
     }
@@ -102,12 +102,12 @@ fn tensorrt_provider(options: &OnnxOptions, static_io_tensor: bool) -> Result<Te
     Ok(provider)
 }
 
-fn cuda_provider(settings: CudaOptions, static_io_tensor: bool) -> Result<CUDA> {
+fn cuda_provider(settings: CudaOptions, cuda_graph: bool) -> Result<CUDA> {
     settings.validate()?;
     Ok(CUDA::default()
         .with_device_id(settings.device_id)
         .with_tf32(settings.tf32)
-        .with_cuda_graph(static_io_tensor && settings.cuda_graph))
+        .with_cuda_graph(cuda_graph))
 }
 
 fn check_tf32(enabled: bool) -> Result<()> {
@@ -173,25 +173,75 @@ fn metadata(session: &Session, declared: &ModelInfo) -> Result<ModelInfo> {
 
 /// A successfully opened provider session and its reusable storage.
 pub(crate) struct ActiveSession {
-    // Drop buffers before the session that owns their native allocators.
-    pub buffers: Option<InferenceBuffers>,
-    pub session: Session,
+    // Option allows Drop to destroy ALL native resources while holding the gate.
+    native: Option<NativeSession>,
     pub backend_index: usize,
     pub info: ModelInfo,
+}
+
+struct NativeSession {
+    // Field order: bindings/tensors/allocators, then ORT, then the owned stream.
+    buffers: Option<InferenceBuffers>,
+    session: Session,
+    stream: Option<CudaStream>,
+    graph_enabled: bool,
+    capture_pending: bool,
+}
+
+impl Drop for ActiveSession {
+    fn drop(&mut self) {
+        let _guard = cuda_graph::teardown();
+        if let Some(stream) = self
+            .native
+            .as_ref()
+            .and_then(|native| native.stream.as_ref())
+        {
+            // Also drain partial work after an inference error before freeing tensors.
+            let _ = stream.synchronize();
+        }
+        drop(self.native.take());
+    }
+}
+
+fn stream_for_backend(options: &OnnxOptions, index: usize) -> Result<Option<CudaStream>> {
+    let device = match &options.backend.candidates()[index] {
+        Backend::Cuda => {
+            let settings = options.cuda.unwrap_or_default();
+            settings.validate()?;
+            Some(settings.device_id)
+        }
+        Backend::TensorRt => {
+            let defaults = TensorRtOptions::default();
+            let settings = options.tensorrt.as_ref().unwrap_or(&defaults);
+            settings.validate()?;
+            check_tf32(settings.tf32)?;
+            Some(settings.device_id)
+        }
+        _ => None,
+    };
+    device.map(CudaStream::new).transpose()
 }
 
 fn configured_builder(
     options: &OnnxOptions,
     index: usize,
     is_ep_context: bool,
-    static_io: bool,
+    cuda_graph: bool,
+    stream: Option<&CudaStream>,
     build_directory: Option<&Path>,
 ) -> Result<SessionBuilder> {
     let candidates = options.backend.candidates();
     let backend = &candidates[index];
     let strict = is_ep_context || matches!(options.backend, BackendSelection::Require(_));
-    // ORT CUDA graphs require sequential execution.
-    let static_io = static_io && !options.parallel_execution;
+    if let Backend::Custom { provider, .. } = backend {
+        ensure!(
+            provider.downcast_ref::<CUDA>().is_none()
+                && provider.downcast_ref::<TensorRT>().is_none(),
+            "Custom CUDA/TensorRT providers are not supported: use Backend::Cuda with CudaOptions \
+             or Backend::TensorRt with TensorRtOptions (CompileTarget::Cuda/TensorRt for compilation) \
+             so native-onnx can own the stream and coordinate CUDA graph capture"
+        );
+    }
     let mut session_builder = builder(options, true)?;
     let cpu_target = matches!(backend, Backend::Cpu)
         || matches!(backend, Backend::Custom { provider, .. } if provider.downcast_ref::<CPU>().is_some());
@@ -202,7 +252,9 @@ fn configured_builder(
     }
     match backend {
         Backend::TensorRt => {
-            let mut provider = tensorrt_provider(options, static_io)?
+            let mut provider = stream
+                .expect("TensorRT stream")
+                .tensorrt_provider(tensorrt_provider(options, cuda_graph)?)
                 .with_engine_cache(false)
                 .with_ep_context_embed_mode(1);
             let configured_cache = std::env::var_os("ORT_TENSORRT_CACHE_PATH")
@@ -224,8 +276,19 @@ fn configured_builder(
             {
                 // A secondary CUDA provider is optional in Auto mode. Invalid options
                 // are handled as an error if CUDA is later tried as the primary provider.
-                if let Ok(provider) = cuda_provider(options.cuda.unwrap_or_default(), false) {
-                    providers.push(provider.build());
+                let settings = options.cuda.unwrap_or_default();
+                let trt_device = options.tensorrt.as_ref().map_or(0, |s| s.device_id);
+                // Providers inside one session must use the same GPU and stream.
+                // A different-device CUDA candidate remains a whole-session fallback.
+                if settings.device_id == trt_device
+                    && let Ok(provider) = cuda_provider(settings, false)
+                {
+                    providers.push(
+                        stream
+                            .expect("TensorRT stream")
+                            .cuda_provider(provider)
+                            .build(),
+                    );
                 }
             }
             session_builder = session_builder
@@ -234,12 +297,11 @@ fn configured_builder(
         }
         Backend::Cuda => {
             session_builder = session_builder
-                .with_execution_providers([cuda_provider(
-                    options.cuda.unwrap_or_default(),
-                    static_io,
-                )?
-                .build()
-                .error_on_failure()])
+                .with_execution_providers([stream
+                    .expect("CUDA stream")
+                    .cuda_provider(cuda_provider(options.cuda.unwrap_or_default(), cuda_graph)?)
+                    .build()
+                    .error_on_failure()])
                 .map_err(ort_error)?;
         }
         #[cfg(target_os = "macos")]
@@ -267,7 +329,9 @@ fn configured_builder(
 
 /// Use ORT's provider-independent compiler; EPs determine which native state they export.
 pub(crate) fn compile(source: &Path, options: &OnnxOptions) -> Result<Vec<u8>> {
-    let builder = configured_builder(options, 0, false, false, None)
+    let _guard = cuda_graph::exclusive()?;
+    let stream = stream_for_backend(options, 0)?;
+    let builder = configured_builder(options, 0, false, false, stream.as_ref(), None)
         .map_err(|error| diagnostics::provider_error(&options.backend.candidates()[0], error))?;
     let compiled = ort::compiler::ModelCompiler::new(builder)?
         .with_model_from_file(source)?
@@ -285,11 +349,33 @@ pub(crate) fn load(
     build_directory: Option<&Path>,
 ) -> Result<ActiveSession> {
     let backend = &options.backend.candidates()[index];
+    // Includes CUDA initialization and allocation, TensorRT plugin registration,
+    // and failed-load cleanup. No session may capture while these operations run.
+    let _guard = cuda_graph::exclusive()?;
+    let stream = stream_for_backend(options, index)
+        .map_err(|error| diagnostics::provider_error(backend, error))?;
+    // Automatic placement can include CPU partitions and data-dependent copies.
+    // Keep that path graph-free rather than letting the default break fallback.
+    let graph_enabled = buffers::eligible(declared)
+        && !options.parallel_execution
+        && (is_ep_context || matches!(options.backend, BackendSelection::Require(_)))
+        && match backend {
+            Backend::Cuda => options.cuda.unwrap_or_default().cuda_graph,
+            Backend::TensorRt => {
+                options
+                    .tensorrt
+                    .as_ref()
+                    .unwrap_or(&TensorRtOptions::default())
+                    .cuda_graph
+            }
+            _ => false,
+        };
     let mut session_builder = configured_builder(
         options,
         index,
         is_ep_context,
-        buffers::eligible(declared),
+        graph_enabled,
+        stream.as_ref(),
         build_directory,
     )
     .map_err(|error| diagnostics::provider_error(backend, error))?;
@@ -297,21 +383,26 @@ pub(crate) fn load(
         .commit_from_file(path)
         .map_err(|error| diagnostics::provider_error(backend, error.into()))?;
     let info = metadata(&session, declared)?;
+    ensure!(
+        !graph_enabled || buffers::eligible(&info),
+        "CUDA graph capture requires fixed positive native I/O shapes; set cuda_graph=false for this model"
+    );
     let device_id = match backend {
-        Backend::TensorRt => options
-            .tensorrt
-            .as_ref()
-            .map_or(0, |settings| settings.device_id),
-        Backend::Cuda => options.cuda.unwrap_or_default().device_id,
+        Backend::TensorRt => Some(
+            options
+                .tensorrt
+                .as_ref()
+                .map_or(0, |settings| settings.device_id),
+        ),
+        Backend::Cuda => Some(options.cuda.unwrap_or_default().device_id),
         #[cfg(target_os = "macos")]
-        Backend::CoreMl => 0,
-        Backend::Cpu | Backend::Custom { .. } => 0,
+        Backend::CoreMl => None,
+        Backend::Cpu | Backend::Custom { .. } => None,
     };
     let buffers = if buffers::eligible(&info) && !matches!(backend, Backend::Custom { .. }) {
         Some(InferenceBuffers::new(
             &session,
             &info,
-            matches!(backend, Backend::TensorRt | Backend::Cuda),
             device_id,
             !is_ep_context && matches!(options.backend, BackendSelection::Auto(_)),
         )?)
@@ -319,42 +410,96 @@ pub(crate) fn load(
         None
     };
     Ok(ActiveSession {
-        session,
-        buffers,
+        native: Some(NativeSession {
+            buffers,
+            session,
+            stream,
+            graph_enabled,
+            capture_pending: graph_enabled,
+        }),
         backend_index: index,
         info,
     })
 }
 
 impl ActiveSession {
+    pub fn buffers(&self) -> Option<&InferenceBuffers> {
+        self.native.as_ref().expect("live session").buffers.as_ref()
+    }
+
+    pub fn buffers_mut(&mut self) -> Option<&mut InferenceBuffers> {
+        self.native.as_mut().expect("live session").buffers.as_mut()
+    }
+
+    pub fn graph_enabled(&self) -> bool {
+        self.native.as_ref().expect("live session").graph_enabled
+    }
+
+    pub fn end_profiling(&mut self) -> Result<String> {
+        let _guard = cuda_graph::shared()?;
+        Ok(self
+            .native
+            .as_mut()
+            .expect("live session")
+            .session
+            .end_profiling()?)
+    }
+
+    pub fn run(&mut self) -> Result<()> {
+        let native = self.native.as_mut().expect("live session");
+        // ORT completes warm-up and capture inside its first successful Run
+        // (including its internal reruns). A failure must not mark it complete.
+        let _capture = if native.capture_pending {
+            Some(cuda_graph::exclusive()?)
+        } else {
+            None
+        };
+        let _execution = if native.capture_pending {
+            None
+        } else {
+            Some(cuda_graph::shared()?)
+        };
+        native
+            .buffers
+            .as_mut()
+            .context("Prepared buffers unavailable")?
+            .run(&mut native.session, native.stream.as_ref())?;
+        native.capture_pending = false;
+        Ok(())
+    }
+
     /// Inputs have already been validated against the model by the public API.
     pub fn inference(
         &mut self,
         info: &ModelInfo,
         inputs: &[TensorView<'_>],
     ) -> Result<Vec<Tensor>> {
-        if let Some(buffers) = &mut self.buffers {
+        if let Some(buffers) = self.buffers_mut() {
             for input in inputs {
                 let slot = buffers
-                    .inputs
+                    .input_tensors
                     .iter_mut()
                     .find(|x| x.name == input.name)
                     .expect("validated input");
                 slot.view_mut()?.data.copy_from(input.data)?;
             }
-            buffers.run(&mut self.session).and_then(|()| {
-                buffers
-                    .outputs
-                    .iter()
-                    .map(|s| Ok(s.view()?.to_owned()))
-                    .collect()
-            })
+            self.run()?;
+            self.buffers()
+                .expect("prepared buffers")
+                .output_tensors
+                .iter()
+                .map(|s| Ok(s.view()?.to_owned()))
+                .collect()
         } else {
+            let _guard = cuda_graph::shared()?;
             let values = inputs
                 .iter()
                 .map(|v| Ok((v.name, input_value(v)?)))
                 .collect::<Result<Vec<_>>>()?;
-            self.session
+            self.native
+                .as_mut()
+                .expect("live session")
+                .session
                 .run(values)
                 .map_err(ort_error)
                 .and_then(|values| {

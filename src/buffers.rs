@@ -1,5 +1,5 @@
 //! Reusable host/device tensors and I/O bindings for static, dense tensor I/O.
-use crate::cuda_transfer;
+use crate::cuda_transfer::CudaStream;
 use crate::{DType, ModelInfo, Result, TensorData, TensorDataMut, TensorView, TensorViewMut};
 use anyhow::{Context, ensure};
 use ort::{
@@ -12,22 +12,25 @@ pub(crate) struct TensorSlot {
     pub name: String,
     pub shape: Vec<usize>,
     dtype: DType,
-    host: DynTensor,
-    device: Option<DynTensor>,
+    host_tensor: DynTensor,
+    device_tensor: Option<DynTensor>,
 }
 pub(crate) struct InferenceBuffers {
-    pub inputs: Vec<TensorSlot>,
-    pub outputs: Vec<TensorSlot>,
-    binding: IoBinding,
-    cuda: bool,
-    device_id: i32,
-    rebind_inputs: bool,
-    inputs_bound: bool,
+    // Persistent caller-visible host tensors for fixed-shape model I/O.
+    pub input_tensors: Vec<TensorSlot>,
+    pub output_tensors: Vec<TensorSlot>,
+    // The ORT I/O binding owns the GPU output tensors when CUDA memory is used.
+    io_binding: IoBinding,
+    // Auto-provider sessions may cache cross-device copies and must rebind every run.
+    rebind_inputs_each_run: bool,
+    // Whether bind_input has completed at least once for this I/O binding.
+    input_bindings_initialized: bool,
+    // Whether host output tensors contain the most recent successful run.
     pub outputs_valid: bool,
     // ORT allocated tensors do not retain the Allocator wrapper. Keep both alive
     // until after all tensors and I/O bindings have been dropped (field order).
-    _host_allocator: Allocator,
-    _device_allocator: Option<Allocator>,
+    _host_allocator_guard: Allocator,
+    _device_allocator_guard: Option<Allocator>,
 }
 
 pub(crate) fn eligible(info: &ModelInfo) -> bool {
@@ -80,14 +83,14 @@ macro_rules! dispatch_dtype {
 macro_rules! view_data {
     ($slot:expr, $variant:ident, $ty:ty) => {
         Ok::<TensorData<'_>, anyhow::Error>(TensorData::$variant(
-            $slot.host.try_extract_tensor::<$ty>()?.1,
+            $slot.host_tensor.try_extract_tensor::<$ty>()?.1,
         ))
     };
 }
 macro_rules! view_data_mut {
     ($slot:expr, $variant:ident, $ty:ty) => {
         Ok::<TensorDataMut<'_>, anyhow::Error>(TensorDataMut::$variant(
-            $slot.host.try_extract_tensor_mut::<$ty>()?.1,
+            $slot.host_tensor.try_extract_tensor_mut::<$ty>()?.1,
         ))
     };
 }
@@ -115,20 +118,21 @@ impl InferenceBuffers {
     pub fn new(
         session: &Session,
         info: &ModelInfo,
-        cuda: bool,
-        device_id: i32,
-        rebind_inputs: bool,
+        device_id: Option<i32>,
+        rebind_inputs_each_run: bool,
     ) -> Result<Self> {
         ensure!(
             eligible(info),
             "Prepared buffers require fixed, positive tensor shapes"
         );
-        let host = if cuda {
+        let cuda = device_id.is_some();
+        let allocator_device_id = device_id.unwrap_or_default();
+        let host_allocator = if cuda {
             Allocator::new(
                 session,
                 MemoryInfo::new(
                     AllocationDevice::CUDA_PINNED,
-                    device_id,
+                    allocator_device_id,
                     AllocatorType::Device,
                     MemoryType::CPUOutput,
                 )?,
@@ -136,12 +140,12 @@ impl InferenceBuffers {
         } else {
             Allocator::default()
         };
-        let device = if cuda {
+        let device_allocator = if cuda {
             Some(Allocator::new(
                 session,
                 MemoryInfo::new(
                     AllocationDevice::CUDA,
-                    device_id,
+                    allocator_device_id,
                     AllocatorType::Device,
                     MemoryType::Default,
                 )?,
@@ -149,103 +153,110 @@ impl InferenceBuffers {
         } else {
             None
         };
-        let mut binding = session.create_binding()?;
-        let mut inputs = Vec::new();
-        let mut outputs = Vec::new();
+        let mut io_binding = session.create_binding()?;
+        let mut input_tensors = Vec::new();
+        let mut output_tensors = Vec::new();
         for spec in &info.inputs {
             let shape = spec.fixed_shape().expect("validated fixed shape");
             // ort rc.13 zeroes CPU-accessible allocations in DynTensor::new.
-            let tensor = DynTensor::new(&host, ort_dtype(spec.dtype), shape.as_slice())?;
-            let device = device
+            let host_tensor =
+                DynTensor::new(&host_allocator, ort_dtype(spec.dtype), shape.as_slice())?;
+            let device_tensor = device_allocator
                 .as_ref()
-                .map(|a| DynTensor::new(a, ort_dtype(spec.dtype), shape.as_slice()))
+                .map(|allocator| DynTensor::new(allocator, ort_dtype(spec.dtype), shape.as_slice()))
                 .transpose()?;
             // Bind only after uploading initialized data in run(). Binding may
             // copy immediately when ORT places this input on another provider.
-            inputs.push(TensorSlot {
+            input_tensors.push(TensorSlot {
                 name: spec.name.clone(),
                 shape,
                 dtype: spec.dtype,
-                host: tensor,
-                device,
+                host_tensor,
+                device_tensor,
             });
         }
         for spec in &info.outputs {
             let shape = spec.fixed_shape().expect("validated fixed shape");
-            let tensor = DynTensor::new(&host, ort_dtype(spec.dtype), shape.as_slice())?;
-            if let Some(a) = &device {
-                binding.bind_output(
+            let host_tensor =
+                DynTensor::new(&host_allocator, ort_dtype(spec.dtype), shape.as_slice())?;
+            if let Some(allocator) = &device_allocator {
+                io_binding.bind_output(
                     &spec.name,
-                    DynTensor::new(a, ort_dtype(spec.dtype), shape.as_slice())?,
+                    DynTensor::new(allocator, ort_dtype(spec.dtype), shape.as_slice())?,
                 )?;
             } else {
                 // Share ownership through a safe view upgrade; cloning copies data.
-                binding.bind_output(
+                io_binding.bind_output(
                     &spec.name,
-                    tensor
+                    host_tensor
                         .view()
                         .try_upgrade()
                         .map_err(|_| anyhow::anyhow!("Cannot share owned output"))?,
                 )?;
             }
-            outputs.push(TensorSlot {
+            output_tensors.push(TensorSlot {
                 name: spec.name.clone(),
                 shape,
                 dtype: spec.dtype,
-                host: tensor,
-                device: None,
+                host_tensor,
+                device_tensor: None,
             });
         }
         Ok(Self {
-            inputs,
-            outputs,
-            binding,
-            cuda,
-            device_id,
-            rebind_inputs,
-            inputs_bound: false,
+            input_tensors,
+            output_tensors,
+            io_binding,
+            rebind_inputs_each_run,
+            input_bindings_initialized: false,
             outputs_valid: false,
-            _host_allocator: host,
-            _device_allocator: device,
+            _host_allocator_guard: host_allocator,
+            _device_allocator_guard: device_allocator,
         })
     }
-    pub fn run(&mut self, session: &mut Session) -> Result<()> {
+    pub fn run(&mut self, session: &mut Session, stream: Option<&CudaStream>) -> Result<()> {
         self.outputs_valid = false;
-        if self.cuda {
-            cuda_transfer::upload(
-                self.inputs
-                    .iter_mut()
-                    .map(|input| (&input.host, input.device.as_mut().expect("CUDA input"))),
-                self.device_id,
-            )
-            .context("Pinned H2D transfers")?;
+        if let Some(stream) = stream {
+            stream
+                .upload(self.input_tensors.iter_mut().map(|input| {
+                    (
+                        &input.host_tensor,
+                        input.device_tensor.as_mut().expect("CUDA input"),
+                    )
+                }))
+                .context("Pinned H2D transfers")?;
         }
         // ORT caches cross-device copies at bind time. Auto mode must rebind after
         // updates so CPU partitions see fresh inputs. Strict GPU sessions keep
         // their original device addresses for CUDA graph replay.
-        if !self.inputs_bound || self.rebind_inputs {
-            for input in &self.inputs {
-                self.binding
-                    .bind_input(&input.name, input.device.as_ref().unwrap_or(&input.host))?;
+        if !self.input_bindings_initialized || self.rebind_inputs_each_run {
+            for input in &self.input_tensors {
+                self.io_binding.bind_input(
+                    &input.name,
+                    input.device_tensor.as_ref().unwrap_or(&input.host_tensor),
+                )?;
             }
-            self.binding.synchronize_inputs()?;
-            self.inputs_bound = true;
+            // bind_input may have queued cross-provider copies. Wait only for
+            // our stream; ORT SynchronizeInputs calls cudaDeviceSynchronize.
+            if let Some(stream) = stream {
+                stream.synchronize()?;
+            }
+            self.input_bindings_initialized = true;
         }
-        let values = session.run_binding(&self.binding).context("Inference")?;
-        if self.cuda {
+        let values = session.run_binding(&self.io_binding).context("Inference")?;
+        if let Some(stream) = stream {
             let device_outputs = self
-                .outputs
+                .output_tensors
                 .iter()
                 .map(|output| values[output.name.as_str()].downcast_ref::<DynTensorValueType>())
                 .collect::<ort::Result<Vec<_>>>()?;
-            cuda_transfer::download(
-                device_outputs
-                    .iter()
-                    .zip(&mut self.outputs)
-                    .map(|(value, output)| (&**value, &mut output.host)),
-                self.device_id,
-            )
-            .context("Pinned D2H transfers")?;
+            stream
+                .download(
+                    device_outputs
+                        .iter()
+                        .zip(&mut self.output_tensors)
+                        .map(|(value, output)| (&**value, &mut output.host_tensor)),
+                )
+                .context("Pinned D2H transfers")?;
         }
         self.outputs_valid = true;
         Ok(())

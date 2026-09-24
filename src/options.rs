@@ -14,7 +14,10 @@ pub enum Backend {
     CoreMl,
     /// ONNX Runtime's CPU execution provider.
     Cpu,
-    /// Configure any existing ORT provider without adding its native dependencies.
+    /// Configure an additional ORT provider without adding its native dependencies.
+    /// CUDA/TensorRT dispatches are rejected: use the built-in variants and typed
+    /// options so the engine can own streams and coordinate graph capture. Custom implementations must
+    /// not register CUDA/TensorRT indirectly.
     Custom {
         /// Display name used in backend reports and fallback events.
         name: String,
@@ -46,7 +49,11 @@ pub struct TensorRtOptions {
     /// Allow TF32 for TensorRT FP32 operations (default true).
     /// The process-wide NVIDIA_TF32_OVERRIDE must be unset for true, or 0 for false.
     pub tf32: bool,
-    /// Enable CUDA graphs for fixed-shape, supported tensor I/O.
+    /// Enable CUDA graphs for fixed-shape tensor I/O with sequential execution.
+    /// Defaults true. Effective only with strict GPU placement or a compiled
+    /// EPContext; automatic placement, dynamic I/O and parallel execution disable it.
+    /// Each session owns a stream. Setup, first-run capture and teardown are
+    /// coordinated across this crate; subsequent sessions can replay concurrently.
     pub cuda_graph: bool,
     /// Maximum builder workspace in bytes, default 4 GiB on 64-bit targets.
     pub workspace_bytes: usize,
@@ -89,7 +96,10 @@ pub struct CudaOptions {
     /// Allow TF32 for CUDA FP32 operations, default true.
     pub tf32: bool,
     /// Capture and replay fixed-shape models through persistent I/O bindings.
-    /// Disabled by default; ignored when graph I/O is not eligible for prepared buffers.
+    /// Defaults true. Requires fixed positive I/O, sequential execution and strict
+    /// GPU placement (or a compiled EPContext). Automatic placement disables it.
+    /// Independent sessions can replay concurrently on their own streams;
+    /// see [`TensorRtOptions::cuda_graph`] for capture coordination.
     pub cuda_graph: bool,
 }
 impl Default for CudaOptions {
@@ -97,7 +107,7 @@ impl Default for CudaOptions {
         Self {
             device_id: 0,
             tf32: true,
-            cuda_graph: false,
+            cuda_graph: true,
         }
     }
 }
@@ -122,6 +132,7 @@ pub enum CompileTarget {
     /// Optimize for CPU; threading is configured in [`CompileOptions`].
     Cpu,
     /// Compile with an explicitly configured installed ORT provider.
+    /// CUDA/TensorRT must use their typed variants, as with [`Backend::Custom`].
     Custom {
         /// Display name used in compilation reports and errors.
         name: String,
@@ -136,8 +147,6 @@ pub enum CompileTarget {
 pub struct CompileOptions {
     /// Required target and its provider-specific compilation settings.
     pub target: CompileTarget,
-    /// Existing ORT shared library; see [`OnnxOptions::runtime_path`].
-    pub runtime_path: Option<PathBuf>,
     /// Threads within an operator during compilation/validation, default 1.
     /// Set to 0 to let ONNX Runtime choose.
     pub intra_threads: usize,
@@ -156,7 +165,6 @@ impl CompileOptions {
     pub fn new(target: CompileTarget) -> Self {
         Self {
             target,
-            runtime_path: None,
             intra_threads: 1,
             inter_threads: 1,
             parallel_execution: false,
@@ -182,7 +190,6 @@ impl CompileOptions {
             }
         };
         Ok(OnnxOptions {
-            runtime_path: self.runtime_path,
             backend: BackendSelection::Require(backend),
             tensorrt,
             cuda,
@@ -228,13 +235,12 @@ impl Default for BackendSelection {
     }
 }
 
-/// Runtime library, backend selection, threading, and model-shape configuration.
+/// Backend selection, threading, profiling, and model-shape configuration.
+///
+/// ONNX Runtime is loaded once per process through the system library loader.
+/// Set `ORT_DYLIB_PATH` before starting the process to override its location.
 #[derive(Clone, Debug)]
 pub struct OnnxOptions {
-    /// Existing ORT shared library; otherwise use ORT_DYLIB_PATH or the platform loader:
-    /// onnxruntime.dll on Windows, libonnxruntime.so on Linux, libonnxruntime.dylib on macOS.
-    /// The process shares one ORT runtime; select it before the first ORT operation.
-    pub runtime_path: Option<PathBuf>,
     /// Required provider or ordered fallback candidates; defaults depend on the platform.
     pub backend: BackendSelection,
     /// Optional TensorRT overrides. `None` uses [`TensorRtOptions::default()`] when selected.
@@ -258,7 +264,6 @@ pub struct OnnxOptions {
 impl Default for OnnxOptions {
     fn default() -> Self {
         Self {
-            runtime_path: None,
             backend: BackendSelection::default(),
             tensorrt: None,
             cuda: None,

@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use native_onnx::{
-    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxRuntime, Result, TensorData,
+    Backend, BackendSelection, CudaOptions, OnnxOptions, OnnxSession, Result, TensorData,
     TensorDataMut, TensorView, f16,
 };
 use onnx_rs::ast::{
@@ -75,7 +75,7 @@ fn mixed_model() -> Result<PathBuf> {
 fn check_repeated(options: OnnxOptions) -> Result<()> {
     let path = mixed_model()?;
     let result = (|| {
-        let mut model = OnnxRuntime::load(&path, options)?;
+        let mut model = OnnxSession::load(&path, options)?;
         assert!(model.is_prepared());
         for factor in [1_i64, 2, 3] {
             let ids = [factor, factor + 1, factor + 2, factor + 3];

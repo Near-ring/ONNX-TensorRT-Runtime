@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 use native_onnx::{
-    CompileOptions, CompileTarget, CompiledFormat, CudaOptions, OnnxOptions, OnnxRuntime, Result,
-    TensorData, TensorRtOptions, TensorView, ep,
+    CompileOptions, CompileReport, CompileTarget, CompiledFormat, CudaOptions, OnnxOptions,
+    OnnxSession, Result, TensorData, TensorRtOptions, TensorView, ep,
 };
 mod common;
 use common::fixture;
@@ -18,7 +18,7 @@ fn cpu_compile_roundtrip_and_output_validation() -> Result<()> {
     std::fs::copy(fixture("linear.onnx"), &source)?;
     let destination = root.join("cpu.onnx");
     let inputs = [TensorView::f32("x", &[1, 16], &[1.; 16])];
-    let result = OnnxRuntime::compile(
+    let result: CompileReport = OnnxSession::compile(
         &source,
         &destination,
         CompileOptions::new(CompileTarget::Cpu),
@@ -27,12 +27,12 @@ fn cpu_compile_roundtrip_and_output_validation() -> Result<()> {
     assert_eq!(result.backend, "CPU");
     assert_eq!(result.format, CompiledFormat::OptimizedOnnx);
     std::fs::remove_file(&source)?;
-    let mut loaded = OnnxRuntime::load(&destination, OnnxOptions::cpu())?;
+    let mut loaded = OnnxSession::load(&destination, OnnxOptions::cpu())?;
     assert_eq!(loaded.inference(&inputs)?[0].view().as_f32()?, &[16.; 16]);
     drop(loaded);
     let before = std::fs::read(&destination)?;
     assert!(
-        OnnxRuntime::compile(
+        OnnxSession::compile(
             fixture("linear.onnx"),
             &destination,
             CompileOptions::new(CompileTarget::Cpu),
@@ -44,7 +44,7 @@ fn cpu_compile_roundtrip_and_output_validation() -> Result<()> {
     let failed = root.join("failed.onnx");
     let bad_input = [TensorView::f32("wrong", &[1], &[0.])];
     assert!(
-        OnnxRuntime::compile(
+        OnnxSession::compile(
             fixture("linear.onnx"),
             &failed,
             CompileOptions::new(CompileTarget::Cpu),
@@ -78,7 +78,7 @@ fn compile_rejects_invalid_target_settings_without_fallback() -> Result<()> {
         ),
     ] {
         let destination = root.path().join("failed.onnx");
-        let error = OnnxRuntime::compile(
+        let error = OnnxSession::compile(
             fixture("linear.onnx"),
             &destination,
             CompileOptions::new(target),
@@ -96,7 +96,7 @@ fn compile_accepts_a_configured_custom_provider() -> Result<()> {
     let root = tempfile::tempdir()?;
     let destination = root.path().join("custom.onnx");
     let inputs = [TensorView::f32("x", &[1, 16], &[1.; 16])];
-    let result = OnnxRuntime::compile(
+    let result = OnnxSession::compile(
         fixture("linear.onnx"),
         &destination,
         CompileOptions::new(CompileTarget::Custom {
@@ -106,7 +106,7 @@ fn compile_accepts_a_configured_custom_provider() -> Result<()> {
         &inputs,
     )?;
     assert_eq!(result.backend, "Configured CPU");
-    let mut model = OnnxRuntime::load(destination, OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(destination, OnnxOptions::cpu())?;
     assert_eq!(model.inference(&inputs)?[0].view().as_f32()?, &[16.; 16]);
     Ok(())
 }
@@ -126,8 +126,8 @@ fn compile_applies_dimension_overrides() -> Result<()> {
     options.inter_threads = 2;
     options.parallel_execution = true;
     options.dimension_overrides.insert("batch".into(), 2);
-    OnnxRuntime::compile(fixture("dynamic.onnx"), &destination, options, &inputs)?;
-    let mut model = OnnxRuntime::load(destination, OnnxOptions::cpu())?;
+    OnnxSession::compile(fixture("dynamic.onnx"), &destination, options, &inputs)?;
+    let mut model = OnnxSession::load(destination, OnnxOptions::cpu())?;
     assert_eq!(model.info().inputs[0].fixed_shape(), Some(vec![2, 3]));
     let outputs = model.inference(&inputs)?;
     let TensorData::I64(output) = outputs[0].view().data else {
@@ -148,14 +148,14 @@ fn compiled_cpu_model_does_not_depend_on_external_source_weights() -> Result<()>
     let source = source_directory.join("model.onnx");
     std::fs::copy(fixture("external.onnx"), &source)?;
     std::fs::copy(fixture("weights.bin"), source_directory.join("weights.bin"))?;
-    let mut reference = OnnxRuntime::load(&source, OnnxOptions::cpu())?;
+    let mut reference = OnnxSession::load(&source, OnnxOptions::cpu())?;
     let info = reference.info().clone();
     let shape = info.inputs[0].fixed_shape().unwrap();
     let values = vec![1.; native_onnx::element_count(&shape)?];
     let inputs = [TensorView::f32(&info.inputs[0].name, &shape, &values)];
     let expected = reference.inference(&inputs)?;
     let destination = root.join("compiled.onnx");
-    OnnxRuntime::compile(
+    OnnxSession::compile(
         &source,
         &destination,
         CompileOptions::new(CompileTarget::Cpu),
@@ -163,7 +163,7 @@ fn compiled_cpu_model_does_not_depend_on_external_source_weights() -> Result<()>
     )?;
     drop(reference);
     std::fs::remove_dir_all(source_directory)?;
-    let mut model = OnnxRuntime::load(&destination, OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(&destination, OnnxOptions::cpu())?;
     assert_eq!(
         expected[0].view().as_f32()?,
         model.inference(&inputs)?[0].view().as_f32()?

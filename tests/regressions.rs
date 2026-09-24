@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use native_onnx::{
-    Backend, BackendSelection, OnnxOptions, OnnxRuntime, Result, TensorData, TensorView,
+    Backend, BackendSelection, OnnxOptions, OnnxSession, Result, TensorData, TensorView,
     TensorViewMut, bf16,
 };
 use onnx_rs::ast::{
@@ -73,7 +73,7 @@ fn unknown_rank_is_not_a_scalar() -> Result<()> {
             ..Default::default()
         },
     ))?;
-    let mut model = OnnxRuntime::load(file.path(), OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(file.path(), OnnxOptions::cpu())?;
     assert!(
         !model.is_prepared(),
         "unknown-rank I/O must not use scalar buffers"
@@ -99,7 +99,7 @@ fn scalar_and_fresh_prepared_inputs_are_zero_initialized() -> Result<()> {
             ..Default::default()
         },
     ))?;
-    let mut model = OnnxRuntime::load(file.path(), OnnxOptions::cpu())?;
+    let mut model = OnnxSession::load(file.path(), OnnxOptions::cpu())?;
     assert!(model.is_prepared());
     model.run()?;
     assert!(matches!(
@@ -140,7 +140,7 @@ fn auto_cuda_cpu_partition_uses_fresh_inputs_for_every_api() -> Result<()> {
             ..Default::default()
         },
     ))?;
-    let mut model = OnnxRuntime::load(
+    let mut model = OnnxSession::load(
         file.path(),
         OnnxOptions {
             backend: BackendSelection::Auto(vec![Backend::Cuda, Backend::Cpu]),
@@ -179,7 +179,7 @@ fn cuda_only_bf16_graph_does_not_require_cpu_kernels() -> Result<()> {
             ..Default::default()
         },
     ))?;
-    let mut model = OnnxRuntime::load(
+    let mut model = OnnxSession::load(
         file.path(),
         OnnxOptions {
             backend: BackendSelection::Require(Backend::Cuda),

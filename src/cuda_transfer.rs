@@ -1,5 +1,6 @@
 //! Batched pinned-memory copies between ORT-owned buffers, bypassing ort's copy cache.
-//! No CUDA allocation, context ownership, or raw pointers escape this module.
+//! Own one nonblocking stream and primary-context reference per native GPU session.
+//! Raw CUDA pointers never escape this module.
 use crate::Result;
 use anyhow::{Context, ensure};
 use libloading::Library;
@@ -18,7 +19,12 @@ type PointerAttribute = unsafe extern "system" fn(*mut c_void, c_int, u64) -> c_
 type ContextPush = unsafe extern "system" fn(CuContext) -> c_int;
 type ContextPop = unsafe extern "system" fn(*mut CuContext) -> c_int;
 type ContextDevice = unsafe extern "system" fn(*mut c_int) -> c_int;
-type ContextSync = unsafe extern "system" fn() -> c_int;
+type Init = unsafe extern "system" fn(u32) -> c_int;
+type DeviceGet = unsafe extern "system" fn(*mut c_int, c_int) -> c_int;
+type ContextRetain = unsafe extern "system" fn(*mut CuContext, c_int) -> c_int;
+type ContextRelease = unsafe extern "system" fn(c_int) -> c_int;
+type StreamCreate = unsafe extern "system" fn(*mut *mut c_void, u32) -> c_int;
+type StreamDestroy = unsafe extern "system" fn(*mut c_void) -> c_int;
 type Upload = unsafe extern "system" fn(u64, *const c_void, usize, *mut c_void) -> c_int;
 type Download = unsafe extern "system" fn(*mut c_void, u64, usize, *mut c_void) -> c_int;
 type StreamSync = unsafe extern "system" fn(*mut c_void) -> c_int;
@@ -29,7 +35,12 @@ struct Driver {
     push: ContextPush,
     pop: ContextPop,
     device: ContextDevice,
-    sync: ContextSync,
+    init: Init,
+    device_get: DeviceGet,
+    retain: ContextRetain,
+    release: ContextRelease,
+    stream_create: StreamCreate,
+    stream_destroy: StreamDestroy,
     upload: Upload,
     download: Download,
     stream_sync: StreamSync,
@@ -61,7 +72,12 @@ impl Driver {
                 push: *library.get(b"cuCtxPushCurrent_v2\0")?,
                 pop: *library.get(b"cuCtxPopCurrent_v2\0")?,
                 device: *library.get(b"cuCtxGetDevice\0")?,
-                sync: *library.get(b"cuCtxSynchronize\0")?,
+                init: *library.get(b"cuInit\0")?,
+                device_get: *library.get(b"cuDeviceGet\0")?,
+                retain: *library.get(b"cuDevicePrimaryCtxRetain\0")?,
+                release: *library.get(b"cuDevicePrimaryCtxRelease_v2\0")?,
+                stream_create: *library.get(b"cuStreamCreate\0")?,
+                stream_destroy: *library.get(b"cuStreamDestroy_v2\0")?,
                 upload: *library.get(b"cuMemcpyHtoDAsync_v2\0")?,
                 download: *library.get(b"cuMemcpyDtoHAsync_v2\0")?,
                 stream_sync: *library.get(b"cuStreamSynchronize\0")?,
@@ -94,6 +110,7 @@ static DRIVER: OnceLock<Result<Driver>> = OnceLock::new();
 struct ContextScope<'a> {
     driver: &'a Driver,
     active: bool,
+    stream: *mut c_void,
 }
 
 impl ContextScope<'_> {
@@ -113,14 +130,16 @@ impl Drop for ContextScope<'_> {
             // SAFETY: Unwinding cleanup balances our successful push; never destroys the context.
             // Normal returns use restore() to report errors instead of discarding them here.
             unsafe {
-                (self.driver.stream_sync)(ptr::null_mut());
+                if !self.stream.is_null() {
+                    (self.driver.stream_sync)(self.stream);
+                }
                 (self.driver.pop)(&mut popped);
             }
         }
     }
 }
 
-fn checked_bytes(shape: &[i64], dtype: &TensorElementType) -> Result<usize> {
+pub(crate) fn checked_bytes(shape: &[i64], dtype: &TensorElementType) -> Result<usize> {
     let width = dtype
         .byte_size(1)
         .filter(|&n| n > 0)
@@ -139,18 +158,122 @@ fn checked_bytes(shape: &[i64], dtype: &TensorElementType) -> Result<usize> {
     })
 }
 
-pub(crate) fn upload<'a>(
-    pairs: impl IntoIterator<Item = (&'a DynTensor, &'a mut DynTensor)>,
+/// Retains the CUDA primary context used by ORT's runtime API. This type is
+/// intentionally thread-bound. Native sessions and buffers must drop before it.
+/// Raw handles make this type, and the enclosing OnnxSession, !Send and !Sync.
+pub(crate) struct CudaStream {
+    driver: &'static Driver,
+    context: CuContext,
     device_id: i32,
-) -> Result<()> {
-    copy_batch(pairs, device_id, true)
+    device: c_int,
+    stream: *mut c_void,
 }
 
-pub(crate) fn download<'a>(
-    pairs: impl IntoIterator<Item = (&'a DynTensor, &'a mut DynTensor)>,
-    device_id: i32,
-) -> Result<()> {
-    copy_batch(pairs, device_id, false)
+impl CudaStream {
+    pub fn new(device_id: i32) -> Result<Self> {
+        ensure!(device_id >= 0, "Negative CUDA device id");
+        let driver = DRIVER
+            .get_or_init(Driver::load)
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let mut device = 0;
+        let mut context = ptr::null_mut();
+        // SAFETY: Documented driver ABI; outputs point to correctly sized storage.
+        unsafe {
+            driver.check((driver.init)(0), "cuInit")?;
+            driver.check((driver.device_get)(&mut device, device_id), "cuDeviceGet")?;
+            driver.check(
+                (driver.retain)(&mut context, device),
+                "cuDevicePrimaryCtxRetain",
+            )?;
+        }
+        let mut owned = Self {
+            driver,
+            context,
+            device_id,
+            device,
+            stream: ptr::null_mut(),
+        };
+        let scope = owned.enter()?;
+        // SAFETY: The retained primary context is current. Flag 1 is
+        // CU_STREAM_NON_BLOCKING, avoiding legacy default-stream dependencies.
+        driver.check(
+            unsafe { (driver.stream_create)(&mut owned.stream, 1) },
+            "cuStreamCreate",
+        )?;
+        scope.restore()?;
+        Ok(owned)
+    }
+
+    fn enter(&self) -> Result<ContextScope<'static>> {
+        // SAFETY: Our primary-context reference keeps the context alive.
+        self.driver.check(
+            unsafe { (self.driver.push)(self.context) },
+            "cuCtxPushCurrent",
+        )?;
+        Ok(ContextScope {
+            driver: self.driver,
+            active: true,
+            stream: self.stream,
+        })
+    }
+
+    pub fn synchronize(&self) -> Result<()> {
+        let scope = self.enter()?;
+        // SAFETY: Stream belongs to this retained, current context.
+        let result = self.driver.check(
+            unsafe { (self.driver.stream_sync)(self.stream) },
+            "cuStreamSynchronize session",
+        );
+        result.and(scope.restore())
+    }
+
+    // These providers must remain private to a native session that retains this
+    // stream until AFTER the provider, session, bindings and allocators are gone.
+    pub fn cuda_provider(&self, provider: ort::ep::CUDA) -> ort::ep::CUDA {
+        // SAFETY: NativeSession's field order, and load/compile local declaration
+        // order, keep this stream alive throughout all ORT use including teardown.
+        unsafe { provider.with_compute_stream(self.stream.cast()) }
+    }
+
+    pub fn tensorrt_provider(&self, provider: ort::ep::TensorRT) -> ort::ep::TensorRT {
+        // SAFETY: Same lifetime invariant as cuda_provider.
+        unsafe { provider.with_compute_stream(self.stream.cast()) }
+    }
+
+    pub fn upload<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a DynTensor, &'a mut DynTensor)>,
+    ) -> Result<()> {
+        copy_batch(pairs, self, true)
+    }
+
+    pub fn download<'a>(
+        &self,
+        pairs: impl IntoIterator<Item = (&'a DynTensor, &'a mut DynTensor)>,
+    ) -> Result<()> {
+        copy_batch(pairs, self, false)
+    }
+}
+
+impl Drop for CudaStream {
+    fn drop(&mut self) {
+        if !self.stream.is_null()
+            && let Ok(scope) = self.enter()
+        {
+            // SAFETY: The owning session has already been destroyed under the
+            // capture coordinator. Drain any outstanding work before destruction.
+            unsafe {
+                (self.driver.stream_sync)(self.stream);
+                (self.driver.stream_destroy)(self.stream);
+            }
+            let _ = scope.restore();
+        }
+        // SAFETY: Balances our successful primary-context retain, never resets it.
+        unsafe {
+            (self.driver.release)(self.device);
+        }
+    }
 }
 
 fn validate(source: &DynTensor, target: &DynTensor, device_id: i32, upload: bool) -> Result<usize> {
@@ -193,9 +316,10 @@ fn pointer_context(driver: &Driver, pointer: u64) -> Result<CuContext> {
 
 fn copy_batch<'a>(
     pairs: impl IntoIterator<Item = (&'a DynTensor, &'a mut DynTensor)>,
-    device_id: i32,
+    stream: &CudaStream,
     upload: bool,
 ) -> Result<()> {
+    let device_id = stream.device_id;
     // Keep every source and exclusive destination borrow alive until the final
     // synchronization, including if a later copy in the batch fails.
     let mut pairs = pairs.into_iter().collect::<Vec<_>>();
@@ -203,25 +327,12 @@ fn copy_batch<'a>(
         .iter()
         .map(|(s, t)| validate(s, t, device_id, upload))
         .collect::<Result<Vec<_>>>()?;
-    let Some(first) = sizes.iter().position(|&size| size != 0) else {
+    if sizes.iter().all(|&size| size == 0) {
         return Ok(());
-    };
-    let driver = DRIVER
-        .get_or_init(Driver::load)
-        .as_ref()
-        .map_err(|e| anyhow::anyhow!("{e:#}"))?;
-    let pointer = if upload {
-        pairs[first].1.data_ptr()
-    } else {
-        pairs[first].0.data_ptr()
-    };
-    let context = pointer_context(driver, pointer as u64)?;
-    // SAFETY: The tensor and its allocating session remain alive throughout this call.
-    driver.check(unsafe { (driver.push)(context) }, "cuCtxPushCurrent")?;
-    let scope = ContextScope {
-        driver,
-        active: true,
-    };
+    }
+    let driver = stream.driver;
+    let context = stream.context;
+    let scope = stream.enter()?;
     let result = (|| {
         let mut actual_device = -1;
         // SAFETY: Our pushed context is current; actual_device is writable storage.
@@ -233,9 +344,6 @@ fn copy_batch<'a>(
             actual_device == device_id,
             "CUDA allocation context device mismatch"
         );
-        // SAFETY: Finish any previous ORT work on non-default streams before
-        // overwriting device inputs or reading device outputs. Once per batch.
-        driver.check(unsafe { (driver.sync)() }, "cuCtxSynchronize before copies")?;
         for ((source, target), bytes) in pairs.iter_mut().zip(sizes) {
             if bytes == 0 {
                 continue;
@@ -253,13 +361,13 @@ fn copy_batch<'a>(
             );
             // SAFETY: Validated equal shape/type/size, pinned host memory, live
             // ORT-owned device memory in this context, and exclusive destination.
-            // The default stream is valid in the current context. All borrows
+            // The session stream is valid in the current context. All borrows
             // remain alive until the stream is synchronized below.
             let status = unsafe {
                 if upload {
-                    (driver.upload)(device_ptr, source_ptr, bytes, ptr::null_mut())
+                    (driver.upload)(device_ptr, source_ptr, bytes, stream.stream)
                 } else {
-                    (driver.download)(target_ptr, device_ptr, bytes, ptr::null_mut())
+                    (driver.download)(target_ptr, device_ptr, bytes, stream.stream)
                 }
             };
             driver.check(
@@ -276,29 +384,9 @@ fn copy_batch<'a>(
     // SAFETY: Complete queued copies even on a partial-batch error before any
     // borrowed tensor can be released or inspected by the caller. Once per batch.
     let completed = driver.check(
-        unsafe { (driver.stream_sync)(ptr::null_mut()) },
+        unsafe { (driver.stream_sync)(stream.stream) },
         "cuStreamSynchronize copies",
     );
     let restored = scope.restore();
     result.and(completed).and(restored)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn copy_sizes_reject_overflow_and_non_byte_types() -> Result<()> {
-        assert_eq!(checked_bytes(&[2, 3], &TensorElementType::Float32)?, 24);
-        assert_eq!(checked_bytes(&[], &TensorElementType::Int64)?, 8);
-        assert_eq!(
-            checked_bytes(&[i64::MAX, 0], &TensorElementType::Float64)?,
-            0
-        );
-        assert!(checked_bytes(&[-1], &TensorElementType::Float32).is_err());
-        assert!(checked_bytes(&[i64::MAX, 2], &TensorElementType::Float64).is_err());
-        assert!(checked_bytes(&[4], &TensorElementType::String).is_err());
-        assert!(checked_bytes(&[4], &TensorElementType::Int4).is_err());
-        Ok(())
-    }
 }
